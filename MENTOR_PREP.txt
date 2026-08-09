@@ -1,0 +1,416 @@
+================================================================================
+MENTOR PREP - ANTICIPATED QUESTIONS WITH MODEL ANSWERS (SESSION 1)
+================================================================================
+
+How to use this file:
+  1. Cover the answer, read the question, try answering aloud.
+  2. Compare with the model answer.
+  3. Mark anything you stumble on and re-read LEARNING_NOTES.txt.
+
+TIP: Practice these two things from memory - they carry most of the session:
+  A) The 7-step generation pipeline
+  B) Temperature vs Top-p difference in one sentence each
+
+
+================================================================================
+SECTION 1 - PROJECT ARCHITECTURE
+================================================================================
+
+Q1: Why use LangChain instead of calling OpenRouter directly?
+
+A: Because LangChain gives one standard interface (the Runnable interface,
+   .invoke()) that works the same regardless of which provider/model answers.
+   Without it, switching providers means rewriting integration code (request
+   format, response parsing, error handling differ per provider). With
+   LangChain, the model becomes a configuration detail - a string - and the
+   application logic is written once against that standard shape. In this
+   project I call the exact same chat.invoke(prompt) for Google Gemma, OpenAI
+   gpt-oss, Nvidia Nemotron, and Poolside Laguna.
+
+   EXTRA CREDIT: OpenRouter itself speaks the OpenAI API format, so we use
+   langchain-openai's ChatOpenAI pointed at OpenRouter's base URL. That's the
+   single integration point; OpenRouter handles the actual routing.
+
+Q2: Why is model_name just a string? What breaks if you hardcode it?
+
+A: Because model_name is a string, changing which model answers a question
+   means changing ONE string in config.py (e.g. COMPARISON_MODELS). Nothing
+   in the logic files needs to change - no branching on provider, no
+   provider-specific code. If we hardcoded "google/gemma-4-31b-it:free"
+   everywhere, switching models would require editing every call site and
+   we'd risk breaking the abstraction. The whole point of Exercise 3's
+   switch_demo.py is to show: same function, two different model strings,
+   zero code changes.
+
+Q3: What happens if one of the 20 calls fails?
+
+A: It never crashes the run. models.ask_model() wraps every call in
+   try/except and ALWAYS returns a dictionary with the same shape. On
+   failure, the "response" is empty and the "error" field holds the message.
+   The table then shows "ERROR: ..." for that row, and the judge transcript
+   includes the error text instead of a response. This is error containment -
+   one failed/rate-limited model doesn't kill the whole comparison.
+
+Q4: Why is there a 3-second delay between calls?
+
+A: OpenRouter's free tier is limited to 20 requests/minute and 50
+   requests/day (unless the account has added $10+ credit, then 1000/day).
+   Without the delay, 20 back-to-back calls could hit the per-minute cap and
+   get rejected. REQUEST_DELAY_SECONDS = 3 in config.py is a simple throttle.
+   It's crude - a real system would use a proper rate limiter with retries
+   and backoff - but it's honest and works for a beginner assignment.
+
+Q5: Why did you put everything in config.py?
+
+A: So behavior is changed by editing configuration, not logic. Models,
+   prompts, parameter values, delay - all live in config.py. The logic files
+   (main, experiments, models) only READ from it. If a free model gets pulled
+   from OpenRouter, I just swap the string in config.py. This is separation
+   of configuration from code - a standard software engineering practice.
+
+Q6: Why 4 models? Why those 5 specific prompts?
+
+A: The 4 models are general-purpose free models from 4 DIFFERENT providers
+   (Google, OpenAI, Nvidia, Poolside) - so we're comparing real variety, not
+   4 models from one vendor. The 5 prompts deliberately cover different
+   capability types: concept explanation (AI engineering), technical
+   explanation (Transformers), code generation (reverse a list), reasoning
+   (the sheep riddle), and summarization (a paragraph). That way the
+   comparison evaluates each model across multiple skill dimensions, not
+   just one kind of task.
+
+
+================================================================================
+SECTION 2 - EXERCISE 1 / LLM-AS-JUDGE
+================================================================================
+
+Q7: Why not just hardcode "Model X is best"?
+
+A: Because the assignment explicitly says not to invent observations. A
+   hardcoded opinion isn't based on evidence - and different runs can give
+   different results. Instead, the project collects ACTUAL measurements
+   (response text, timing, lengths, tokens) and feeds them to a judge model
+   with strict instructions to base its comparison ONLY on that data. That's
+   the LLM-as-judge technique used in industry to evaluate model outputs at
+   scale.
+
+Q8: Why does the judge use temperature 0.3?
+
+A: Temperature controls randomness. The judge's job is careful, grounded
+   evaluation - we want deterministic, consistent judgment, not creative
+   freedom. Low temperature (0.3) makes the distribution peaked so the judge
+   tends to produce a stable, factual summary rather than inventing colorful
+   but unsupported conclusions.
+
+Q9: The judge reads its own transcript - could the judge itself hallucinate
+    or be biased? (GOTCHA)
+
+A: Yes - this is a real, known weakness of LLM-as-judge. The judge is also
+   an LLM, so it can also make things up or favor certain phrasing. We
+   mitigate it in three ways: (1) strict prompt instructions to use ONLY the
+   given data and not speculate, (2) low temperature for determinism, (3) we
+   anchor every claim to the actual numbers in the transcript. But we cannot
+   fully guarantee the judge's summary is accurate - we acknowledge it as a
+   limitation. This honesty is what a mentor wants to hear.
+
+Q10: How do you know the timing is a fair comparison across models?
+
+A: We don't fully - and that's an important caveat. time_seconds includes
+   network latency, OpenRouter's queueing, and the provider's load, not just
+   the model's computation speed. On one run, a slow network request to a
+   fast model could look slower. So time is ONE signal among many (alongside
+   response quality, length, tokens), not a definitive ranking. A fairer test
+   would run many samples and average, or measure tokens-per-second rather
+   than wall-clock time.
+
+Q11: Real tokens vs estimated tokens - when does the API omit usage, and how
+     do you tell them apart in the table?
+
+A: Some models/providers return a "usage" object with real token counts;
+   some free models omit it. The code tries two sources: LangChain's
+   usage_metadata, then the raw response_metadata token_usage. If both are
+   missing, we estimate with len(text)//4 (1 token ~= 4 characters). In the
+   table, real counts show as a plain number; estimates show as "~N (est.)".
+   That honest labeling distinguishes MEASURED data from ESTIMATED data -
+   important because an estimate is just a heuristic, not a fact.
+
+
+================================================================================
+SECTION 3 - TEMPERATURE / TOP-P / LOGITS
+================================================================================
+
+Q12: What does temperature ACTUALLY change inside the model?
+
+A: It scales the LOGITS (the raw scores the Transformer outputs for every
+   vocabulary token) BEFORE softmax converts them to probabilities:
+   scaled_logit = logit / temperature.
+   - temp < 1: gaps widen -> distribution more peaked -> deterministic
+   - temp = 1: unchanged
+   - temp > 1: gaps narrow -> distribution flatter -> more random
+   So temperature literally reshapes the probability distribution. It does
+   NOT make the model smarter or dumber - only changes how random the token
+   choice is.
+
+Q13: What happens at temperature 0?
+
+A: Division by zero - so implementations clamp it (divide by a tiny value
+   like 1e-8), which makes the largest logit get probability ~1. That means
+   the model always picks the single most likely token = GREEDY decoding.
+   Output is essentially deterministic (in practice providers don't
+   guarantee exact reproducibility, but behavior is the same).
+
+Q14: If temperature 0 is deterministic, why not always use it?
+
+A: Because deterministic doesn't mean best. At temp 0 the model always picks
+   the most probable next token, which tends to produce safe, repetitive,
+   stiff text - especially for creative tasks (stories, marketing, ideas).
+   Higher temperature explores more of the distribution, giving variety and
+   creativity. That's why the exercise uses a CREATIVE prompt for the
+   temperature sweep - the effects are most visible there. The right
+   temperature depends on the task: 0 for math/logic, higher for creative.
+
+Q15: Temperature vs top-p - same thing? (KEY QUESTION)
+
+A: No - they're different mechanisms applied at different stages:
+   - TEMPERATURE RESHAPES the distribution (flattens or peaks the whole
+     curve) by scaling logits before softmax.
+   - TOP-P FILTERS the distribution (cuts off the low-probability tail)
+     after softmax, then renormalizes.
+   Both increase variety when raised, but differently: temperature controls
+   HOW RANDOM, top-p controls HOW RISKY (which candidates are even allowed).
+   The order is: temperature -> softmax -> top-p -> sampling.
+
+Q16: Why does top-p renormalize after cutting tokens? (GOTCHA)
+
+A: Because probabilities must always sum to 1. When top-p discards tokens
+   (sets their probability to 0), the kept tokens' probabilities still sum
+   to less than 1. Renormalization divides each kept probability by their
+   total, so the survivors get boosted share and the distribution is valid
+   for sampling again. Example: kept tokens sum to 0.92, so each is divided
+   by 0.92 -> they now sum to 1.00.
+
+Q17: Top-p vs top-k - what's the difference?
+
+A: Both filter the candidate pool, but:
+   - TOP-K always keeps a FIXED number of tokens (e.g. top 50), even when
+     most have near-zero probability (wasteful when the model is confident).
+   - TOP-P keeps an ADAPTIVE number: it keeps adding tokens by probability
+     until their combined weight reaches p. When the model is confident
+     (one token at 0.95), p=0.9 keeps just that token. When uncertain (ten
+     at 0.09), it keeps ~10. The pool size self-adjusts to the model's
+     confidence - that's why top-p is preferred.
+
+Q18: Why sweep top-p at temperature 0.9 in Exercise 2?
+
+A: Because at temperature 0 the distribution is a single spike - filtering a
+   spike with any top-p value changes nothing, so all four top-p results
+   would look identical and teach us nothing. By pinning temperature HIGH
+   (0.9), the distribution is flat and there's real variety for top-p to
+   filter - so p=0.2 vs p=1.0 genuinely differ and the effect is visible.
+   This shows the interaction: temperature reshapes first, top-p filters
+   second.
+
+Q19: What's the range of logits?
+
+A: In theory, unbounded - they're raw outputs of a linear layer, so any real
+   number is possible. In practice, in a trained model with normalization
+   layers, they typically sit around -10 to +10 (occasionally -20 to +20).
+   But crucially, the ABSOLUTE values don't matter - only the GAPS between
+   them do. Adding a constant to all logits changes nothing (the e^c factor
+   cancels in softmax). Temperature works by resizing those gaps.
+
+Q20: What happens if a response hits max_tokens?
+
+A: The generation loop just stops - the model gets cut off mid-sentence. In
+   the max-tokens sweep (50/100/200/500) with an explanatory prompt, you can
+   literally see answers truncated at low limits. It's not "dumber", it just
+   ran out of budget. The response length grows roughly proportionally with
+   max_tokens - which is the honest signal that the parameter is working.
+
+
+================================================================================
+SECTION 4 - LLM FUNDAMENTALS
+================================================================================
+
+Q21: In one sentence, what is an LLM?
+
+A: An LLM is a large neural network trained on massive text that generates
+   text by repeatedly predicting the most probable next token given all the
+   tokens before it.
+
+Q22: How is a full answer actually generated?
+
+A: It's a loop:
+   1. Prompt -> tokenized into tokens
+   2. Transformer processes them -> LOGITS (one score per vocab token)
+   3. Temperature scales the logits (divide by temp)
+   4. Softmax converts scaled logits into PROBABILITIES
+   5. Top-p optionally filters the distribution (cuts the tail)
+   6. SAMPLING picks ONE token (weighted random)
+   7. Append the token, repeat until a stop token or max_tokens is reached
+   The whole response is thousands of these steps chained together.
+
+Q23: Why sub-word tokens instead of words?
+
+A: Two reasons: (1) vocabulary size - there are millions of possible words
+   but ~30K-200K useful tokens; (2) handling unseen words - a new word can
+   be assembled from known sub-word pieces. BPE (Byte-Pair Encoding) builds
+   these by iteratively merging the most frequent character pairs. ~1 token
+   ~= 3/4 of a word. The project's len(text)//4 is only a rough estimate of
+   this.
+
+Q24: Why does the model hallucinate about the 2050 World Cup?
+
+A: Because the model MUST output the most plausible next token - it has no
+   "I can't answer" default. No real answer exists in its training data, but
+   it was trained to continue text as plausibly as possible, so it invents:
+   "Argentina defeated...". Hallucination is the EXPECTED behavior of a
+   next-token predictor, not a surprising bug. This is exactly what the
+   hallucination prompts in Exercise 2 are designed to expose.
+
+Q25: What is the context window and what happens if you exceed it?
+
+A: The context window is the maximum number of tokens the model can look at
+   for a single response - its "working memory". If your input (prompt +
+   past messages) exceeds it, old tokens get truncated or rejected (the API
+   errors with "context length exceeded"). Everything the model "knows" for
+   an answer must fit inside that window - which is why you paste relevant
+   documents into prompts rather than the model remembering them.
+
+Q26: Explain self-attention in one line.
+
+A: Self-attention lets every token in the context compute a weight for every
+   other token - "how much do I care about each one?" - so the model can
+   resolve meaning using the surrounding words (e.g. two different meanings
+   of "bank" in one sentence). This is the core mechanism of the Transformer
+   architecture.
+
+Q27: How do you know the model isn't actually "thinking"?
+
+A: The model has no internal reasoning or facts database. It computes
+   probabilities over tokens using learned statistical patterns. When it
+   appears to reason (e.g. the sheep riddle), it's generating the most
+   probable continuation it learned from training data - which can look
+   intelligent but can also fail on simple logic if the pattern wasn't in
+   the data. Understanding this is why we evaluate and test rather than
+   trust.
+
+
+================================================================================
+SECTION 5 - STRUCTURED OUTPUT
+================================================================================
+
+Q28: Why does "please return JSON" sometimes fail?
+
+A: Because prompting alone is fragile: the model may add prose before/after
+   ("Here's your JSON:"), wrap it in ```json code fences, misspell field
+   names, or use a different structure than requested. You'd have to write
+   cleanup/retry logic. The model "tries", but nothing enforces validity.
+
+Q29: How does the LLM "know" JSON?
+
+A: Three layers:
+   1. TRAINING: JSON is everywhere in its training data (API docs, configs,
+      code) - it internalized the grammar like it learned English.
+   2. CONDITIONING: when the schema is in the prompt, attention lets the
+      model align its output with the schema's keys/types - "schema says
+      there's a confidence number, so emit \"confidence\": <number>".
+   3. FINE-TUNING: function-calling models were explicitly trained to emit
+      special tool-call tokens - that's a dedicated skill, not a hope.
+
+Q30: Function calling vs prompting - why is one more reliable?
+
+A: Prompting asks politely; function calling is a fine-tuned behavior. The
+   model is trained on millions of examples to emit a structured tool-call
+   sequence (model, function name, JSON arguments), and the SDK recognizes
+   that special format and parses the arguments as JSON. There's a fixed,
+   well-defined contract - so it's far less likely to produce prose or
+   malformed output than an open-ended "please give me JSON" prompt.
+
+Q31: What is constrained decoding? (GOOD GOTCHA)
+
+A: Some engines don't just HOPE for valid output - they ENFORCE it at token
+   sampling time. The JSON schema is compiled into a state machine
+   (automaton) of legal continuations. At each step, the sampler asks "given
+   tokens so far, which vocabulary tokens are legal next?" and sets the
+   probability of every illegal token to ZERO. After '{"confidence":' only
+   digits/./- are legal, so the model literally cannot output invalid JSON.
+   This guarantees validity. OpenAI Structured Outputs, Gemini response_schema,
+   and vLLM use this approach.
+
+Q32: What does Pydantic actually do?
+
+A: Pydantic defines typed data models (Python classes) with validation. In
+   structured output, the JSON string parsed from the model's response is
+   validated against the Pydantic schema - field names, types, required
+   fields are checked - and you get a typed Python object (e.g.
+   verdict.best_for_beginners) instead of a raw string you'd have to
+   manually parse. If the data doesn't match the schema, it raises a
+   validation error instead of silently corrupting your program.
+
+Q33: How would you make the Exercise 1 judge output usable by a program?
+
+A: Convert it to structured output. Define a Pydantic schema (e.g.
+   best_for_beginners, best_coding, best_reasoning, weaknesses per model),
+   wrap the judge model with with_structured_output(Schema), and the judge
+   returns a typed object instead of prose. Then downstream code could do
+   verdict.best_coding without string-parsing. This demonstrates schema ->
+   function calling -> typed object end to end.
+
+
+================================================================================
+SECTION 6 - THE 5 GOTCHA ANSWERS TO REMEMBER
+================================================================================
+
+1. "Your judge reads its own transcript - how do you know it didn't make
+   things up?" -> We can't fully guarantee it; LLM-as-judge has this known
+   weakness. We mitigate with strict "use ONLY this data" instructions, low
+   temperature (0.3), and anchoring claims to real numbers - but we
+   acknowledge it as a limitation.
+
+2. "If top-p cuts tokens, doesn't that make the model dumber?" -> It removes
+   the garbage tail (tokens with tiny probability) and renormalizes the
+   survivors. It trades variety for safety/relevance. The remaining pool is
+   still meaningful - the model isn't dumber, it's more focused.
+
+3. "Temperature 0 = same answer every time?" -> Essentially yes (greedy
+   decoding), but providers don't guarantee bit-for-bit reproducibility;
+   numerical differences can still slip through. Behaviorally it's
+   deterministic.
+
+4. "len(text)//4 - is that a good token estimate?" -> No, it's a rough
+   heuristic. Real tokenizers (BPE) are context-dependent: a word can be 1
+   token or several, and spaces/formatting matter. The table honestly labels
+   it as "(est.)" precisely because it's approximate.
+
+5. "The table shows time - is a faster model 'better'?" -> Not necessarily.
+   Time includes network latency, queueing, and provider load. It's ONE
+   signal among many, not a quality ranking. Fairer would be averaging many
+   runs or measuring tokens-per-second.
+
+
+================================================================================
+SECTION 7 - TWO THINGS TO PRACTICE FROM MEMORY
+================================================================================
+
+A) THE 7-STEP GENERATION PIPELINE:
+   1. Prompt -> tokens
+   2. Transformer -> logits (score per vocab token)
+   3. Temperature scales logits
+   4. Softmax -> probabilities
+   5. Top-p filters (cuts tail, renormalizes)
+   6. Sampling picks one token
+   7. Append, repeat until stop / max_tokens
+
+B) ONE-SENTENCE DIFFERENCES:
+   - Temperature: RESHAPES the distribution - lower = peaked/deterministic,
+     higher = flat/random.
+   - Top-p: FILTERS the distribution - cuts the low-probability tail and
+     renormalizes; pool size adapts to model confidence.
+   - max_tokens: HARD STOP on how many tokens the loop may output.
+   - LLM: a next-token predictor trained on massive text.
+   - LangChain abstraction: model = a string; app logic written once.
+
+================================================================================
+END OF MENTOR PREP
+================================================================================

@@ -526,3 +526,14 @@ PROJECT UPGRADE IDEA (structured judge):
 ================================================================================
 END OF NOTES
 ================================================================================
+
+
+
+
+1. Prompt → tokenized into tokens
+2. Transformer processes tokens → outputs LOGITS (one score per vocab token)
+3. Temperature scales the logits (divide by temp)
+4. Softmax turns scaled logits into PROBABILITIES
+5. Top-p filters the distribution (optional cutoff)
+6. Sampling picks ONE token
+7. Append it, repeat from step 2 until stop/max_tokens
