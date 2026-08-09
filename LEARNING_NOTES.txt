@@ -1,0 +1,528 @@
+================================================================================
+AI ENGINEERING - LEARNING NOTES (SESSION 1)
+Date: 2026-08-09
+Topic: LLM Fundamentals - Project Walkthrough, Tokens, Temperature,
+       Top-p, Max Tokens, Logits, and Structured Output
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Project Overview (Week 1 Assignment)
+2.  Exercise 1 - Compare Free OpenRouter Models (deep dive)
+3.  What is an LLM?
+4.  Tokens - the unit of text
+5.  The output distribution (core concept)
+6.  Temperature - how it affects answers internally
+7.  Top-p (nucleus sampling) - step-by-step calculation
+8.  Max tokens
+9.  Logits - range and why only gaps matter
+10. Structured Output - forcing LLM to return JSON/objects
+11. Key Vocabulary
+12. Key Takeaways
+
+
+================================================================================
+1. PROJECT OVERVIEW (Week 1 Assignment)
+================================================================================
+
+Project: Python + LangChain + OpenRouter, using only FREE OpenRouter models.
+No other AI SDK is used - every request goes through OpenRouter.
+
+File structure:
+  .env.example      template for the API key
+  .env              actual key (OPENROUTER_API_KEY)
+  requirements.txt  langchain, langchain-openai, python-dotenv, rich
+  config.py         ALL settings: models, prompts, parameter values
+  models.py         talks to OpenRouter through LangChain (only file doing this)
+  utils.py          terminal tables + unique_word_ratio + rate-limit sleep
+  experiments.py    Exercise 2 logic
+  switch_demo.py    tiny Exercise 3 demo
+  main.py           the menu you actually run
+
+Three exercises:
+  Exercise 1 - Compare 4 free models on 5 prompts (20 API calls)
+  Exercise 2 - Experiment with LLM parameters (temperature/top-p/max_tokens)
+               plus hallucination prompts
+  Exercise 3 - LangChain lesson + model-switch demo (swap model = swap 1 string)
+
+Key design decisions:
+  - Everything prints to terminal (rich tables), nothing written to disk
+  - REQUEST_DELAY_SECONDS = 3 to respect OpenRouter free tier (20 req/min,
+    50 req/day)
+  - All prompts/params live in config.py so behavior changes there,
+    not in logic files
+
+
+================================================================================
+2. EXERCISE 1 - COMPARE FREE OPENROUTER MODELS (DEEP DIVE)
+================================================================================
+
+WHAT IT DOES (main.py run_exercise_1):
+  1. Takes 5 fixed prompts (explain AI engineering, explain Transformers,
+     write reverse-list code, sheep-counting riddle, summarize a paragraph)
+  2. Sends all 5 to each of the 4 models (google/gemma-4-31b-it:free,
+     openai/gpt-oss-20b:free, nvidia/nemotron-3-nano-30b-a3b:free,
+     poolside/laguna-s-2.1:free) => 4 x 5 = 20 API calls
+  3. Records for each call: model, time, response length, token usage
+     (real from API or estimated len(text)//4), and the response text
+  4. Renders 20 rows as a rich table
+  5. Builds a transcript of every response + timing, sends it to a JUDGE
+     model (openai/gpt-oss-20b:free, temperature 0.3) with instructions to
+     compare strictly using ONLY the actual run data
+
+THE CORE PATTERN: LLM-as-judge
+  - Instead of hardcoding opinions ("Model X is great"), the project
+    feeds real measured data into a model and lets it summarize.
+  - Judge prompt rules to learn:
+      * Give the model a role ("You are comparing several LLMs...")
+      * Constrain to the data ("Based ONLY on... do not speculate")
+      * Enumerate the deliverable (quality, coding, reasoning, speed...)
+      * Low temperature (0.3) for deterministic, careful output
+
+THE ABSTRACTION POINT (models.py get_chat_model):
+  - model_name is just a STRING. Everything else (HTTP format, response
+    parsing) is identical because OpenRouter speaks the OpenAI API format.
+  - Four different model families all invoked via chat.invoke(prompt)
+    and all return an AIMessage with .content.
+  - Swap models = change one string in config.py. Zero code changes.
+
+ERROR CONTAINMENT (models.py ask_model):
+  - Always returns a dict with the same shape, success or failure.
+  - One failing/rate-limited model never crashes the whole run.
+
+TOKEN EXTRACTION (models.py extract_token_usage):
+  - Two-layer fallback: LangChain usage_metadata, then raw API token_usage.
+  - If neither exists, estimate: len(text)//4 (1 token ~= 4 chars).
+  - Honest labeling in the table: real count vs "~N (est.)".
+
+RATE LIMITING:
+  - Free tier = 20 req/min, 50 req/day.
+  - 20 calls (Ex1) + ~16 (Ex2) + judge calls > 50/day => will hit the cap.
+    Expected, not a bug.
+
+NOTE ON DETERMINISM:
+  - Same prompt + same params != same output (LLMs sample).
+  - One run is a sample, not ground truth.
+
+
+================================================================================
+3. WHAT IS AN LLM?
+================================================================================
+
+LLM = Large Language Model
+  - Language: processes text (and increasingly images/audio)
+  - Model: a mathematical function with billions of parameters
+  - Large: billions of parameters, trained on essentially the whole internet
+
+THE CORE MECHANISM (deceptively simple):
+  LLM predicts the NEXT TOKEN given all tokens before it, one at a time.
+  A complete answer = thousands of next-token predictions in a loop.
+
+  "The capital of France is _" -> P(Paris)=0.87, P(Lyon)=0.05, ...
+
+WHY PREDICTING THE NEXT WORD PRODUCES "INTELLIGENCE":
+  Predicting the next word forces the model to learn:
+    grammar (sound correct) -> meaning (be coherent) -> facts (be accurate)
+    -> reasoning patterns (be logical) -> common sense
+  These abilities EMERGE as byproducts of one simple objective.
+
+THE ARCHITECTURE: TRANSFORMER
+  Key mechanism = SELF-ATTENTION: every token looks at every other token
+  in context and decides "how much do I care about each one?"
+  This resolves ambiguous words using context.
+
+THREE THINGS TO INTERNALIZE:
+  A) An LLM is a TEXT PROBABILITY MACHINE, not a database.
+     It stores statistical patterns, not facts. It GENERATES the most
+     probable continuation; it does not retrieve facts.
+  B) HALLUCINATION comes from this. Ask about the 2050 World Cup - no
+     correct answer exists in training data, but the model is built to
+     always produce the most plausible next token. It invents. This is
+     EXPECTED behavior of a next-token predictor, not a shocking bug.
+  C) CONTEXT WINDOW = working memory. Model only sees a limited token
+     window per response. Everything it "knows" for an answer must fit
+     there - why we paste documents into prompts.
+
+TRAINING PIPELINE (high level):
+  1. Pretraining: trillions of tokens from web/books/code. Objective:
+     predict next token. Gives general language ability. Expensive.
+  2. Fine-tuning: curated instruction-response pairs so it answers
+     questions instead of continuing text. Produces "helpful assistant".
+  3. RLHF / alignment: humans/models rank answers; model prefers what
+     people rate highly. Why ChatGPT feels helpful and safe.
+  4. Inference: the trained network serves your requests (what our
+     project does at $0 via OpenRouter free models).
+
+
+================================================================================
+4. TOKENS - THE UNIT OF TEXT
+================================================================================
+
+- An LLM does not read words; it reads TOKENS (sub-word chunks).
+- "unhappiness" might tokenize as ["un", "happi", "ness"].
+- ~1 token ~= 3/4 of a word. 100 tokens ~= 75 words (rule of thumb).
+- Tokenizer used by OpenAI = BPE (Byte-Pair Encoding).
+- Vocabulary size is typically 30K-200K distinct tokens.
+- Our estimate len(text)//4 is a rough approximation of real tokenizers.
+- max_tokens limits how many tokens the generation loop may output.
+
+WHY TOKENS INSTEAD OF WORDS:
+  Words are too coarse and too many; sub-word chunks balance size and
+  coverage (can handle unseen words as combinations of known pieces).
+
+
+================================================================================
+5. THE OUTPUT DISTRIBUTION (core concept)
+================================================================================
+
+After processing, the Transformer's last step produces ONE NUMBER for
+every token in the vocabulary (log-probabilities). Normalized, they are
+probabilities:
+
+  After "The capital of France is":
+    Paris   0.870
+    Lyon    0.052
+    Marseille 0.024
+    London  0.003
+    ...(for every token in vocab, most ~= 0)
+
+EVERYTHING (temperature, top-p, sampling) is about what we do with this
+distribution:
+  - GREEDY decoding: always take the most probable token. Deterministic,
+    boring, repetitive.
+  - SAMPLING: pick randomly weighted by probability. Makes output varied
+    and creative. This is what real LLMs do.
+
+THE PARAMETERS ARE APPLIED IN THIS ORDER:
+  1. Prompt -> tokenized into tokens
+  2. Transformer -> LOGITS (one score per vocab token)
+  3. TEMPERATURE scales the logits (divide by temp)
+  4. SOFTMAX turns scaled logits into PROBABILITIES
+  5. TOP-P filters the distribution (optional cutoff)
+  6. SAMPLING picks ONE token
+  7. Append token, repeat until stop token or max_tokens
+
+
+================================================================================
+6. TEMPERATURE - HOW IT AFFECTS ANSWERS INTERNALLY
+================================================================================
+
+Temperature reshapes the logits BEFORE softmax:
+  scaled_logit = logit / temperature
+
+- temp < 1: divides => logits grow in magnitude => gaps WIDEN =>
+  distribution more PEAKED => deterministic, safe, repetitive
+- temp = 1: no change
+- temp > 1: logits shrink => gaps NARROW => distribution FLATTER =>
+  random, surprising, mistake-prone
+- temp = 0: implementation clamps to ~1e-8 => argmax token gets prob 1 =>
+  pure greedy decoding
+
+WORKED EXAMPLE (logits [4.5, 4.0, 3.5], roughly equal candidates):
+  temp 0.2 -> scaled [22.5, 20, 17.5] -> probs ~ [1.00, ~0, ~0]
+              => almost always token A (very deterministic)
+  temp 1.0 -> scaled [4.5, 4.0, 3.5]  -> probs [0.50, 0.30, 0.20]
+              => mixed but A favored
+  temp 2.0 -> scaled [2.25, 2.0, 1.75] -> probs [0.37, 0.33, 0.30]
+              => nearly a coin flip (very random)
+
+RULE TO REMEMBER:
+  Lower temperature = more peaked = more deterministic/repetitive.
+  Higher temperature = flatter = more surprising/varied/mistake-prone.
+
+CRITICAL: temperature does NOT make the model "think harder" or "be
+smarter". It ONLY changes how random the token choice is.
+
+WHAT WE SEE IN EXERCISE 2 (creative prompt, unique_word_ratio metric):
+  - temp 0: nearly identical wording every run
+  - temp 0.2-0.5: coherent, slightly varied
+  - temp 0.8-1.0: more unique word choices, occasional weirdness
+  - unique_word_ratio (unique words / total words) quantifies variety:
+    higher ratio = more varied/creative. utils.py:9
+
+
+================================================================================
+7. TOP-P (NUCLEUS SAMPLING) - STEP-BY-STEP CALCULATION
+================================================================================
+
+Top-p is a FILTER applied AFTER temperature. It is a completely different
+mechanism: it cuts the distribution, it does not reshape it.
+
+PROCEDURE:
+  1. Sort all tokens by probability, descending.
+  2. Add tokens to the candidate set, highest probability first, until
+     their CUMULATIVE probability reaches p.
+  3. DISCARD everything else (set probability to 0).
+  4. RENORMALIZE the survivors (divide each by their sum).
+  5. Sample from the renormalized survivors.
+
+FULL WORKED EXAMPLE (top-p = 0.9), tiny 8-token vocabulary:
+  Step 1-2 (sort + accumulate until sum >= 0.9):
+    Token  P     running sum   reach 0.9?   keep?
+    A      0.55  0.55          no           yes
+    B      0.20  0.75          no           yes
+    C      0.10  0.85          no           yes
+    D      0.07  0.92          YES -> STOP  yes
+    E      0.04  (not reached)              no
+    F      0.02                             no
+    G      0.01                             no
+    H      0.01                             no
+  => candidate pool = {A, B, C, D}
+
+  Step 3-4 (renormalize survivors; sum was 0.92, must become 1.0):
+    Token  old P   new P = old P / 0.92
+    A      0.55    0.55/0.92 = 0.598
+    B      0.20    0.20/0.92 = 0.217
+    C      0.10    0.10/0.92 = 0.109
+    D      0.07    0.07/0.92 = 0.076
+                                    Sum = 1.000
+
+  Step 5 (sample): A 59.8%, B 21.7%, C 10.9%, D 7.6%
+  E-H can NEVER be picked with p=0.9.
+
+COMPARISON:
+  p = 0.5  -> pool {A,B}    -> narrow, predictable
+  p = 0.9  -> pool {A,B,C,D}-> sensible middle ground
+  p = 1.0  -> everything    -> model can pick long-shot tokens (variety
+              AND nonsense risk)
+
+THE ADAPTIVE MAGIC (why top-p beats fixed top-k):
+  top-k always keeps k tokens (wasteful when model is confident).
+  top-p adapts the pool size to the model's confidence:
+    - Very confident (A=0.95): p=0.9 stops after A alone -> tight pool
+    - Very uncertain (ten at 0.09): p=0.9 keeps ~10 -> wide pool
+
+KEY RULE: temperature and top-p BOTH increase creativity when raised,
+but differently:
+  - temperature FLATTENS the whole curve (more random)
+  - top-p CUTS THE TAIL (more risky tokens removed)
+  Combine them: control both how random AND how risky sampling is.
+
+WHY EXERCISE 2 SWEEPS TOP-P AT temperature=0.9 (experiments.py):
+  At temp 0 the distribution is one spike; filtering a spike has no
+  effect - all top-p values would look identical. At temp 0.9 the
+  distribution is flat, so p=0.2 vs p=1.0 genuinely differ.
+  Temperature first (reshape), top-p second (filter).
+
+ONE-SENTENCE SUMMARY:
+  Top-p says: "Sort candidates by likelihood, take the top ones until
+  their combined weight reaches p, throw away the rest, re-normalize,
+  and sample from what's left." Pool size self-adjusts to confidence.
+
+
+================================================================================
+8. MAX TOKENS
+================================================================================
+
+- Simplest parameter. A HARD STOP on the generation loop.
+- while not stop_token and tokens_generated < max_tokens: generate.
+- At max_tokens=50 the model gets cut off mid-sentence - you literally
+  see truncation in the table. Not "dumber", just out of budget.
+- In Exercise 2: response length grows roughly proportionally with
+  max_tokens - the honest signal it's working.
+
+
+================================================================================
+9. LOGITS - RANGE AND WHY ONLY GAPS MATTER
+================================================================================
+
+WHAT ARE LOGITS:
+  Raw unnormalized scores from the Transformer's last linear layer:
+    logit = W*x + b
+  One score per vocabulary token. They exist BEFORE softmax.
+
+RANGE:
+  - No fixed max/min. In theory unbounded: (-inf, +inf).
+  - In practice, in a TRAINED model with normalization layers, logits
+    typically fall around -10 to +10 (often -20 to +20).
+  - Think of it like human heights: no law forbids 30 feet, but you only
+    ever see 4-8 feet.
+
+WHAT ACTUALLY MATTERS = THE GAPS, NOT THE ABSOLUTE VALUES:
+  Adding a constant to ALL logits changes NOTHING:
+    softmax([3,2,1]) = softmax([103,102,101]) = [0.67, 0.24, 0.09]
+  Proof: e^(x+c) = e^x * e^c, the e^c cancels in normalization.
+
+  What matters is the spacing:
+    [3,2,1]      -> gaps of 1 -> [0.67, 0.24, 0.09]  confident, not certain
+    [5,0,-5]     -> gaps of 5 -> [0.99, 0.006, 0.0004] very confident
+    [1,0.9,0.8]  -> tiny gaps  -> [0.36, 0.33, 0.31]  almost a coin flip
+  Bigger gaps = more peaked = more deterministic.
+  Smaller gaps = flatter = more random.
+
+TEMPERATURE RESIZES THE GAPS:
+  scaled = logit / temperature
+  - temp 0.2: gaps x5 larger -> range "stretched" -> peaked -> deterministic
+  - temp 1.0: unchanged
+  - temp 2.0: gaps x0.5 -> compressed -> flattened -> random
+
+  Example [3,2,1]:
+    temp 0.2 -> [15,10,5] -> probs ~ [0.993, 0.0067, 0.00005]
+    temp 2.0 -> [1.5,1.0,0.5] -> probs [0.43, 0.33, 0.24]
+
+ONE-LINER:
+  Logits are unbounded raw scores (typically ~-10 to +10 in a trained
+  model), but only the RELATIVE GAPS matter - temperature stretches or
+  compresses those gaps, and softmax converts the result to probabilities.
+
+
+================================================================================
+10. STRUCTURED OUTPUT - FORCING LLM TO RETURN JSON/OBJECTS
+================================================================================
+
+THE PROBLEM:
+  chat.invoke(prompt) returns a STRING. Real apps need DATA:
+    {"sentiment": "positive", "confidence": 0.93, "topics": [...]}
+  Prose output cannot drive program logic. Structured output = making
+  the LLM's text conform to a schema YOU define.
+
+THE FIVE WAYS (strongest to weakest):
+
+  LEVEL 0 - "Please return JSON" (naive)
+    Ask in the prompt. Works sometimes. Model may add prose, wrap in
+    ```json fences, or typo field names. Fragile.
+
+  LEVEL 1 - JSON mode (response_format)
+    OpenAI-compatible APIs (incl. OpenRouter):
+      ChatOpenAI(..., model_kwargs={"response_format": {"type": "json_object"}})
+    Tells backend the final answer must be valid JSON. Works via prompt
+    instructions + optionally constrained decoding.
+
+  LEVEL 2 - Function calling / tool calling (PRIMARY modern mechanism)
+    Give the model a function schema (name, description, parameters with
+    types/enums/required). The model is TRAINED to emit a special internal
+    token sequence meaning "I want to call this function with these JSON
+    args". SDK intercepts it, parses the args string as JSON, returns a
+    structured object. No manual string-splitting.
+    This is a DEDICATED FINE-TUNING SKILL - why it's far more reliable
+    than "please give me JSON".
+
+  LEVEL 3 - LangChain with_structured_output() (what you use in practice)
+    Wrapper that builds the function-calling setup for you.
+    Mode A (default, via function calling):
+      from pydantic import BaseModel, Field
+      class Sentiment(BaseModel):
+          sentiment: str = Field(description="positive/negative/neutral")
+          confidence: float = Field(description="0 to 1")
+      structured = chat.with_structured_output(Sentiment)
+      result = structured.invoke("This support was amazing!")
+      # result is a typed Sentiment object: .sentiment, .confidence
+    Mode B (json_mode, for models without function calling):
+      structured = chat.with_structured_output(Sentiment, method="json_mode")
+      Injects schema INTO the prompt as instructions + uses JSON mode.
+
+  LEVEL 4 - PydanticOutputParser (prompt-based, model-agnostic)
+    parser = PydanticOutputParser(pydantic_object=Sentiment)
+    chain = prompt | chat | parser
+    get_format_instructions() generates a verbose instruction block
+    describing the JSON schema; the parser parses and RETRIES on failure.
+    Works on any model, no function-calling needed.
+
+HOW THE LLM "RECOGNIZES" THE PATTERN (3 layers):
+  Layer 1 - Training data: JSON is everywhere (API docs, configs, code).
+    The model internalized JSON grammar during pretraining the same way
+    it learned English: by predicting millions of JSON tokens.
+  Layer 2 - The schema CONDITIONS generation: via attention, every token
+    generated can look back at the schema tokens and align - "schema says
+    there's a confidence number, so emit \"confidence\": <a number>".
+  Layer 3 - Function calling is FINE-TUNING, not just prompting. Models
+    were explicitly trained to emit special markers like:
+      <tool_call>... <parameters>{"sentiment": "positive"} </tool_call>
+    The SDK recognizes the marker, extracts, JSON-parses.
+
+THE DEEPEST ANSWER - CONSTRAINED DECODING:
+  Some engines (OpenAI Structured Outputs, Gemini response_schema, local
+  vLLM) don't just HOPE - they ENFORCE validity at token-sampling time:
+    1. JSON schema -> compiled into an AUTOMATON (state machine of what's
+       legal next).
+    2. At each step, ask the automaton: "given tokens so far, which vocab
+       tokens are legal next?" (after '{"confidence":' only digits/./-).
+    3. Set probability of every ILLEGAL token to ZERO. The sampler cannot
+       pick them. Output is GUARANTEED valid.
+  This is why strict structured output differs from prompting - the
+  entire response IS the JSON, guaranteed.
+
+FULL PIPELINE FOR ONE STRUCTURED CALL:
+  Pydantic schema -> with_structured_output -> function-calling schema
+  -> injected (as tool definition or prompt instructions)
+  -> model generates (biased by training + fine-tuning)
+  -> optional constrained decoding blocks invalid tokens
+  -> SDK intercepts tool-call / parses JSON
+  -> validates against Pydantic model (type checks)
+  -> returns typed Python object
+
+PROJECT UPGRADE IDEA (structured judge):
+  Make the Exercise 1 judge return structured JSON instead of prose:
+    class ModelVerdict(BaseModel):
+        best_for_beginners: str
+        best_coding: str
+        best_reasoning: str
+        weaknesses: dict
+    judge = models.get_chat_model(config.JUDGE_MODEL, temperature=0.3)
+              .with_structured_output(ModelVerdict)
+    verdict = judge.invoke(question)
+
+
+================================================================================
+11. KEY VOCABULARY
+================================================================================
+
+  Token           The unit of text an LLM reads/writes (~3/4 of a word)
+  Parameters      The learned numbers defining the model
+  Context window  Max tokens the model can look at per response
+  Inference       Running a trained model to generate a response
+  Logits          Raw unnormalized scores for every vocab token
+  Softmax         Function converting logits to probabilities
+  Sampling        Choosing the next token from a probability distribution
+  Greedy          Always choosing the most likely token (temp 0)
+  Temperature     Reshapes the distribution (peaked vs flat)
+  Top-p           Filters the distribution (cuts the tail)
+  Top-k           Always keep the k most likely tokens (fixed size)
+  Max tokens      Hard stop on generation length
+  BPE             Byte-Pair Encoding, the tokenizer algorithm
+  Transformer     The architecture; uses self-attention
+  Self-attention  Every token attends to every other token in context
+  Hallucination   Model confidently generating false content
+  RAG             Retrieval-Augmented Generation (docs + LLM)
+  LLM-as-judge    Using an LLM to evaluate LLM outputs
+  Structured output  LLM output conforming to a schema (JSON/objects)
+  Function calling   Model trained to emit schema'd tool-call tokens
+  Constrained decoding  Sampler blocks tokens invalid per a grammar
+  with_structured_output  LangChain wrapper for schema'd output
+  Pydantic        Python library for typed, validated data models
+
+
+================================================================================
+12. KEY TAKEAWAYS
+================================================================================
+
+  1. An LLM is a next-token predictor. All apparent intelligence emerges
+     from one simple objective applied to huge data.
+  2. Generation pipeline order:
+     tokens -> Transformer logits -> temperature (scale) -> softmax
+     (probabilities) -> top-p (filter) -> sampling (pick one) -> repeat
+  3. Temperature controls HOW RANDOM. Lower = deterministic/repetitive;
+     higher = varied/mistake-prone. Not "smarter/dumber".
+  4. Top-p controls HOW RISKY. It cuts the low-probability tail and
+     re-normalizes; pool size adapts to model confidence.
+  5. Logits are unbounded but typically ~-10..+10. Only the gaps matter;
+     temperature resizes the gaps.
+  6. Hallucination is EXPECTED behavior of a next-token predictor - the
+     model must output something and chooses the most plausible token.
+  7. Model abstraction (LangChain + OpenRouter): change the model = change
+     ONE string in config.py. The application logic never changes.
+  8. Error containment: always return a result object, never crash the
+     run on a single failed request.
+  9. LLM-as-judge: evaluate LLMs with LLMs, grounded in real measured
+     data - role, constraints, enumerated deliverables, low temperature.
+  10. Structured output: schema (Pydantic) -> with_structured_output ->
+      function calling -> typed Python object. The most reliable methods
+      use fine-tuned function calling or constrained decoding, not just
+      "please return JSON".
+  11. Free-tier rate limits are real engineering constraints: budget your
+      API calls, add delays, expect daily caps.
+  12. One run is a sample, not ground truth - LLMs are stochastic.
+
+================================================================================
+END OF NOTES
+================================================================================
