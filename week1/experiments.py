@@ -84,7 +84,7 @@ def generate_experiment_summary(temp_results, top_p_results, max_tokens_results,
         "Based ONLY on the actual experiment data below, write a clear summary covering: "
         "1) how temperature affected creativity, 2) how temperature affected determinism, "
         "3) how top-p affected diversity, 4) how max_tokens affected response length, "
-        "5) concrete examples of hallucination from the data, 6) lessons learned. "
+        "5) based of data what you think is there any hallucinations model done?, 6) lessons learned. "
         "Reference the actual numbers and text given. Do not invent data that is not shown below.\n\n"
         f"{transcript}"
     )
