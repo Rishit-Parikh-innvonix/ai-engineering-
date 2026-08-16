@@ -1,0 +1,101 @@
+Week 2 (JS) - Mentor Prep
+===========================
+
+Prep notes for talking through week2-js in a mentor session. Assumes you can
+already answer the week2 (Python) questions in week2/MENTOR_PREP.txt - this
+file focuses on the JS-specific follow-ups a mentor is likely to ask once
+they see both versions side by side.
+
+Q: Why build this in JS at all, if the Python version already works?
+A: To prove the concepts (SSE streaming, structured-output validation,
+   async concurrency) aren't tied to Python or FastAPI - they're general
+   backend/AI-engineering patterns. Rebuilding the same thing in a
+   different language forces you to separate "what LangChain/FastAPI did
+   for me" from "what I actually understand," because in JS none of it is
+   there to lean on by accident.
+
+Q: What's the single biggest structural difference between the two servers?
+A: FastAPI's StreamingResponse takes an async generator and handles writing
+   it to the socket and closing the connection for you. Express has no such
+   abstraction - app.ts calls res.write() manually for every SSE line and
+   res.end() manually when the stream is done or errors out. Same outcome,
+   one less layer of magic.
+
+Q: How does the JS server know when a client has disconnected mid-stream?
+A: res.on("close", ...) - registered once when the request comes in, it
+   fires when the underlying connection closes for any reason. app.ts
+   captures that into a `disconnected` boolean via closure and checks it on
+   every chunk inside the streaming loop, the same polling-per-chunk pattern
+   as the Python version's `await request.is_disconnected()`, just pushed via
+   an event instead of polled via a function call.
+
+Q: Where's the JSON-mode + validation logic, and how is it different from
+   using LangChain's built-in structured output helpers?
+A: extraction.ts, mirroring extraction.py exactly: call the model with
+   modelKwargs: { response_format: { type: "json_object" } } (JSON-mode -
+   guarantees valid JSON syntax, not valid shape), then JSON.parse the text
+   and run it through SupportTicketSchema.parse() (zod - guarantees the
+   *shape*: right fields, right types, priority/issue_type inside the
+   allowed enum). This project deliberately does NOT use LangChain.js's
+   `.withStructuredOutput(schema)` helper, which uses a different mechanism
+   (tool/function calling) under the hood - the point here was to replicate
+   the Python version's specific two-layer JSON-mode-then-validate approach
+   step for step, not to find the shortest path to structured output.
+
+Q: What happens on a malformed response?
+A: Same reject-and-retry loop as Python: JSON.parse throwing a SyntaxError,
+   or SupportTicketSchema.parse throwing a ZodError, both get caught and
+   treated as "malformed, retry" (up to EXTRACTION_MAX_RETRIES = 3, same as
+   Python). Any other kind of error (e.g. a real network failure) is logged
+   and retried too, but categorized separately in the log line so you can
+   tell "the model answered but the answer was garbage" apart from "the
+   request itself failed."
+
+Q: Why is there a hand-written retry loop instead of a library like tenacity?
+A: There's no equivalent decorator-based retry library in common JS use for
+   this pattern, so models.ts's ainvokeWithRetry writes the exponential
+   backoff out explicitly: on a retryable error (network error, or HTTP 429
+   / 5xx), wait min(8000ms, 1000ms * 2^(attempt-1)) and try again, up to 3
+   attempts, then rethrow. This is deliberately the same backoff formula
+   tenacity's wait_exponential(multiplier=1, min=1, max=8) uses - just
+   visible in the code instead of hidden in a decorator.
+
+Q: How is bounded concurrency implemented without asyncio.Semaphore?
+A: syncVsAsync.ts defines a small Semaphore class by hand: a counter of
+   available "slots" and a queue of pending resolvers. acquire() either
+   takes a free slot immediately or waits on a Promise that release()
+   resolves later. It's ~15 lines and reproduces exactly what
+   asyncio.Semaphore(3) does in the Python version - cap concurrent
+   OpenRouter requests at 3 so the free-tier 20-req/minute limit isn't hit.
+
+Q: What were the actual measured results, and do they match the Python run?
+A: Same shape, not identical numbers (different runs, different network
+   conditions, and Node/Python have different startup overhead): JS sync
+   took 15.71s / async took 2.11s for the same 6 prompts at concurrency 3 -
+   a 7.45x speedup. Peak memory stayed flat (82.1MB vs 84.7MB) between
+   modes in both languages, for the same underlying reason: this workload
+   is I/O-bound, not memory-bound, so concurrency buys wall-clock time, not
+   reduced memory use.
+
+Q: If you had to productionize this, what would you change first?
+A: Same three things as the Python version's mentor prep, plus one
+   JS-specific item: swap the hand-written getFormatInstructions() /
+   JSON.parse / zod.parse chain for LangChain.js's
+   `.withStructuredOutput(schema)` (tool-calling-based structured output),
+   which is more reliable across models that don't strictly honor
+   response_format: json_object. This project used the manual version on
+   purpose, to make every validation step visible for learning - a real
+   service would prefer the built-in helper.
+
+Gotchas worth mentioning if asked
+------------------------------------
+- Both the Python and JS servers default to port 8000 - they can't run at
+  the same time on the default port. Set PORT=8010 (or similar) via env var
+  to run the JS one alongside the Python one, as done for testing here.
+- `chat.stream(messages)` in LangChain.js returns a Promise you must await
+  before you can `for await` over it - `for await (const c of chat.stream(m))`
+  without the inner `await` is a TypeScript compile error, not a silent bug.
+- Node buffers stdout when it's redirected to a file/pipe (not a TTY) more
+  aggressively than when attached to an interactive terminal - console.log
+  lines can lag behind real request handling if you're tailing a redirected
+  log file, even though the actual HTTP responses are already correct.

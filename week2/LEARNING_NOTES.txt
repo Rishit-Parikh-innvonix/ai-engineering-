@@ -1,0 +1,529 @@
+================================================================================
+AI ENGINEERING - LEARNING NOTES (SESSION 2)
+Date: 2026-08-15
+Topic: Working with LLM APIs - FastAPI, SSE Streaming, Structured Outputs,
+       Function Calling, Retries/Rate Limits, Tokens/Cost, Async
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Project Overview (Week 2 Assignment)
+2.  Chat Completions API - system / user / assistant roles
+3.  Server-Sent Events (SSE) - what it actually is, on the wire
+4.  FastAPI StreamingResponse + async generators
+5.  Detecting client disconnects
+6.  Structured outputs - the five levels, applied for real this time
+7.  Function / tool calling - the mechanism, step by step
+8.  Error handling, retries, and rate limits
+9.  Token counting and cost estimation
+10. Async API usage - why it actually helps
+11. Prompt templates (ChatPromptTemplate)
+12. Key vocabulary
+13. Key takeaways
+
+
+================================================================================
+1. PROJECT OVERVIEW (Week 2 Assignment)
+================================================================================
+
+Project: Python + FastAPI + LangChain + OpenRouter, same free models as week1.
+Week1 was a CLI menu; week2 is a small backend service, because this week's
+topic is building robust *integrations*, not one-off scripts.
+
+Three exercises:
+  Exercise 1 - GET /ask/stream: SSE streaming endpoint, disconnect handling,
+               latency logging (app.py)
+  Exercise 2 - POST /extract: structured extraction with JSON-schema
+               validation and reject/retry (app.py + extraction.py)
+  Exercise 3 - sync_vs_async.py: measured sync vs concurrent async throughput
+
+Key design decisions:
+  - LangChain again (not the raw openai SDK) for consistency with week1's
+    model-abstraction lesson - model_name is still just a string.
+  - Two separate retry mechanisms, deliberately: a transport-level one
+    (tenacity, exponential backoff, in models.py) for network/rate-limit
+    failures, and a schema-level one (a plain for-loop, in extraction.py)
+    for "the model answered but the answer didn't validate." Conflating
+    these would mean retrying an expensive validation-triggering mistake
+    with the same slow backoff schedule meant for network errors, or
+    retrying a network blip with no backoff at all.
+  - Everything measured in this file and in README.md is from a real run
+    against OpenRouter, not invented - same principle week1 followed for
+    its LLM-as-judge summaries.
+
+
+================================================================================
+2. CHAT COMPLETIONS API - SYSTEM / USER / ASSISTANT ROLES
+================================================================================
+
+Every message sent to a chat model has a ROLE:
+  system     - instructions about how the model should behave for the whole
+               conversation (tone, constraints, persona). Set once.
+  user       - what the human (or, here, the API caller) actually asked.
+  assistant  - the model's own prior replies, fed back in on the next turn
+               so the model has memory of the conversation.
+
+Why separate system from user instead of one big string?
+  - The model is fine-tuned to weight system instructions differently -
+    they act as durable constraints that should survive across turns,
+    while user messages are the thing being responded to right now.
+  - It's swappable: change the system prompt (in prompts.py) without
+    touching a single line of code that builds requests.
+  - It matches how every real chat product is actually built - a fixed
+    system prompt + a growing list of user/assistant turns.
+
+WHERE THIS SHOWS UP IN THE PROJECT (prompts.py):
+  stream_prompt_template: system message sets "concise chat assistant"
+    behavior once; {question} becomes the user message.
+  extraction_prompt_template: system message constrains the model to
+    "only use facts in the email, respond with JSON only"; the human
+    message carries the schema instructions + the actual email text.
+
+This project never needs the assistant role for its own request-building,
+because neither exercise is a multi-turn conversation - but
+tool_calling_demo.py DOES use it: the model's tool-call request gets
+appended back into the message list as an AIMessage (assistant turn)
+before the tool's result (a ToolMessage) and the follow-up call. That's
+the general pattern for any multi-step interaction: keep appending to
+the same message list, roles and all.
+
+
+================================================================================
+3. SERVER-SENT EVENTS (SSE) - WHAT IT ACTUALLY IS, ON THE WIRE
+================================================================================
+
+SSE is NOT a special protocol or a second connection like WebSockets. It's
+one ordinary HTTP response that never "finishes" in the normal sense - the
+server keeps the connection open and keeps writing to it, and the client
+reads it incrementally instead of waiting for Content-Length bytes.
+
+THE WIRE FORMAT (what app.py actually writes):
+  Content-Type: text/event-stream
+  Cache-Control: no-cache
+
+  event: start
+  data: {"request_id": "45025e6c", "model": "openai/gpt-oss-20b:free"}
+
+  data: {"token": "A"}
+
+  data: {"token": " race"}
+
+  event: done
+  data: {"elapsed_seconds": 6.68, "chunks": 44, "characters": 245}
+
+RULES:
+  - Each event is one or more `field: value` lines, terminated by a BLANK
+    line (\n\n). That blank line is how the client knows "this event is
+    complete, deliver it."
+  - `data:` is required; `event:` is optional (defaults to a generic
+    "message" event if omitted) - this project uses it to distinguish
+    start/token/done/error without the client having to parse every
+    payload to figure out what kind of message it got.
+  - Multiple `data:` lines in one event get joined with \n on the client
+    side - not used here (each event is single-line JSON), but useful for
+    multi-line payloads.
+
+WHY SSE INSTEAD OF WEBSOCKETS FOR THIS:
+  - It's one-directional (server -> client), which is all a "stream this
+    answer" endpoint needs. WebSockets are full-duplex - more machinery
+    than the problem requires.
+  - It's plain HTTP - works through the same proxies, load balancers, and
+    auth middleware as every other endpoint. No protocol upgrade handshake.
+  - Browsers have a built-in client (EventSource) for GET-based SSE - this
+    project instead uses a raw httpx stream in stream_client.py so it can
+    also be a POST-style test from a plain script, but the wire format is
+    identical either way.
+
+WHY THE ENDPOINT IS GET, NOT POST:
+  Browsers' native EventSource can only do GET. This project's endpoint
+  takes `question` as a query parameter for that reason, even though a
+  POST body would feel more natural for a longer question. A production
+  version fronted by a real browser client would keep it GET for the same
+  reason; a pure backend-to-backend client (like stream_client.py) doesn't
+  care either way since it isn't using EventSource.
+
+
+================================================================================
+4. FASTAPI STREAMINGRESPONSE + ASYNC GENERATORS
+================================================================================
+
+`app.py`'s `_stream_events` is an ASYNC GENERATOR - a function with `yield`
+inside an `async def`. Calling it doesn't run any code; it returns an
+async iterator. FastAPI's `StreamingResponse` pulls one item at a time from
+that iterator and writes each one to the HTTP response as soon as it's
+produced - it does NOT wait for the generator to finish before sending
+anything, which is the entire point.
+
+THE LOOP:
+  async for chunk in chat.astream(messages):
+      ...
+      yield f"data: {json.dumps({'token': token})}\n\n"
+
+`chat.astream(...)` is itself an async generator (LangChain's), so this is
+one async generator (ours) driving another (LangChain's), which is in turn
+reading Server-Sent Events off OpenRouter's own streaming response - three
+layers of "produce data as it arrives" stacked on top of each other, and
+none of them buffer the whole response before passing it along.
+
+WHY ASYNC (not a plain generator) MATTERS HERE:
+  A plain `for` + `yield` would block FastAPI's whole event loop while
+  waiting on the network between chunks - during that wait, the process
+  couldn't serve any OTHER request. `async for` yields control back to the
+  event loop while awaiting the next chunk, so a single Uvicorn worker can
+  have many `/ask/stream` requests genuinely in flight at once instead of
+  serializing them.
+
+
+================================================================================
+5. DETECTING CLIENT DISCONNECTS
+================================================================================
+
+`await request.is_disconnected()` is a Starlette/FastAPI method that checks
+whether the underlying connection has been closed by the client (tab
+closed, fetch aborted, curl killed with Ctrl-C) - it does NOT throw; it
+returns a bool you check yourself.
+
+WHY CHECK IT INSIDE THE LOOP, NOT JUST ONCE:
+  A single check before starting would only catch a client that disconnects
+  before the first token. Real disconnects happen mid-stream - the user
+  changes their mind after reading three sentences. Checking on every
+  iteration (every token) means the loop notices within one token of the
+  disconnect and stops pulling further chunks from `chat.astream()`
+  immediately, rather than generating (and paying OpenRouter quota for)
+  tokens nobody will ever see.
+
+WHAT "GRACEFUL" MEANS HERE, CONCRETELY:
+  - No exception is raised or leaked to a client that's no longer there to
+    receive it.
+  - The generator just `return`s - FastAPI treats that as "the response is
+    done," and Uvicorn closes the connection cleanly.
+  - It's LOGGED (elapsed time + chunk count at the point of disconnect) so
+    a partial/abandoned request is visible in the same log stream as a
+    normal one, not silently swallowed.
+
+
+================================================================================
+6. STRUCTURED OUTPUTS - THE FIVE LEVELS, APPLIED FOR REAL THIS TIME
+================================================================================
+
+Week1's notes described five levels of structured output (naive prompting,
+JSON mode, function calling, LangChain's with_structured_output, and
+PydanticOutputParser) as theory. This project actually uses two of them
+together, stacked:
+
+  LEVEL 1 (JSON mode) - models.get_json_mode_chat_model() passes
+    model_kwargs={"response_format": {"type": "json_object"}} straight
+    into the request body. This is a SYNTAX guarantee only: "the reply
+    will parse as JSON." It says nothing about which keys or types that
+    JSON contains - a perfectly valid but useless {"foo": "bar"} still
+    satisfies json mode.
+
+  LEVEL 4 (PydanticOutputParser) - extraction.parser wraps schemas.py's
+    SupportTicket. get_format_instructions() generates a text block
+    describing the exact fields/types/enums expected, which gets injected
+    into the prompt (prompts.py). parser.parse(text) then does the real
+    work: parses the JSON AND validates every field against the schema -
+    wrong type, missing field, or a Literal value outside the allowed
+    set all raise instead of silently passing.
+
+WHY STACK THESE TWO INSTEAD OF USING JUST ONE:
+  JSON mode alone can't catch "priority": "asap" (valid JSON, invalid for
+  our Literal enum). PydanticOutputParser alone, without JSON mode, is
+  fighting a model that might still wrap its answer in prose or code
+  fences - json mode is what makes level-4 parsing reliable enough to
+  bother retrying against, rather than failing on formatting noise every
+  time. Together: json mode narrows the failure surface to "wrong data,"
+  and Pydantic is what actually catches wrong data.
+
+WHY NOT LEVEL 2/3 (native function calling / with_structured_output) HERE:
+  Function calling is a great, more heavily fine-tuned mechanism - but not
+  every free OpenRouter model reliably supports tool calls (tool_calling_
+  demo.py's own fallback path exists for exactly this reason: "the model
+  answered directly without calling the tool"). JSON mode + manual Pydantic
+  validation works across a wider range of models and, just as important
+  for this exercise, makes the "reject malformed, retry" logic fully
+  visible in extraction.py instead of hidden inside a framework method -
+  the assignment explicitly asks you to implement that logic yourself.
+
+
+================================================================================
+7. FUNCTION / TOOL CALLING - THE MECHANISM, STEP BY STEP
+================================================================================
+
+tool_calling_demo.py's real, measured run:
+
+  Step 1 - sending the question with a tool available...
+  Step 2 - model requested a tool call: lookup_priority_policy({'issue_type': 'technical'})
+  Step 3 - tool executed locally, returned: "Technical issues blocking work are 'urgent'..."
+  Step 4 - sending the tool result back to the model for a final answer...
+  Final answer: **Priority: Urgent** ...
+
+WHAT ACTUALLY HAPPENED, IN ORDER:
+  1. chat.bind_tools([lookup_priority_policy]) attaches the tool's schema
+     (name, docstring-as-description, typed args from the @tool-decorated
+     function's signature) to every request this chat instance makes.
+  2. chat_with_tools.invoke(messages) sends the conversation PLUS the tool
+     schema. The model - trained specifically to recognize when a tool
+     would help - responds not with prose but with a structured
+     "tool_calls" field: which tool, with which JSON arguments.
+  3. THE MODEL NEVER RUNS THE FUNCTION. It only requests that it be run.
+     Our own code (`lookup_priority_policy.invoke(tool_call["args"])`)
+     executes the actual Python function locally.
+  4. The result is wrapped in a ToolMessage and appended to the message
+     list (alongside the model's own AIMessage tool-call request - the
+     model needs to see its own prior turn to make sense of the
+     ToolMessage that follows it), and the whole list is sent back.
+  5. The model, now able to see the tool's actual result, produces a
+     final, ordinary text answer.
+
+THIS IS WHY IT'S MORE RELIABLE THAN "PLEASE RETURN JSON":
+  The model was explicitly fine-tuned on millions of examples of this
+  exact five-step pattern. It isn't guessing at a format from prose
+  instructions; emitting a well-formed tool_calls block is closer to a
+  trained reflex than a request it's trying to satisfy.
+
+
+================================================================================
+8. ERROR HANDLING, RETRIES, AND RATE LIMITS
+================================================================================
+
+TWO RETRY LAYERS IN THIS PROJECT, AND WHY THEY'RE SEPARATE:
+
+  Transport retry (models.ainvoke_with_retry, via tenacity):
+    @retry(stop=stop_after_attempt(3),
+           wait=wait_exponential(multiplier=1, min=1, max=8),
+           retry=retry_if_exception_type((APIConnectionError, RateLimitError, APIError)))
+    Fires when the REQUEST itself failed to complete - dropped connection,
+    OpenRouter returned 429 (rate limited) or a 5xx. Exponential backoff
+    (1s, then up to 2s, then up to 4s...) gives a struggling
+    provider/network time to recover instead of hammering it immediately
+    again. Retrying here is safe because nothing was learned from this
+    attempt - it never actually got an answer to reject.
+
+  Schema-validation retry (extraction.extract_support_ticket, a plain loop):
+    Fires when the request SUCCEEDED but the answer failed validation. No
+    backoff - the problem wasn't the network being slow, it was the model
+    producing a bad answer, and there's no reason to believe waiting
+    longer changes that. Each attempt is a fresh call (new sampling), which
+    is what actually gives a different attempt a chance to succeed.
+
+  Why not one retry loop for everything? Because "wait 4 seconds and try
+  the exact same thing again" is the right response to a 429, and a
+  complete non-answer to "the model picked an invalid enum value." Merging
+  them would mean either backing off unnecessarily on validation failures
+  (slow) or retrying network failures with no backoff (rude to the
+  provider, more likely to get rate-limited again).
+
+WHAT "REJECT" ACTUALLY MEANS HERE:
+  If all attempts in extraction.py fail, the function returns an error
+  string instead of a best-effort guess. app.py turns that into an HTTP
+  422 (Unprocessable Entity) with the last error message as the detail -
+  the caller gets a clear, typed failure instead of malformed data that
+  LOOKS like a valid ticket but isn't.
+
+RATE LIMITS, CONCRETELY:
+  Same free-tier numbers as week1: 20 requests/minute, 50/day. This
+  project respects that by keeping Exercise 3's prompt count and
+  concurrency low (config.ASYNC_CONCURRENCY = 3, 6 prompts) rather than by
+  adding a client-side rate limiter - at this scale, staying comfortably
+  under the ceiling is simpler and just as effective as building a token
+  bucket. A production system calling a paid tier at higher volume would
+  want an actual limiter (or would rely on the SDK's own, since most
+  provider SDKs implement one) - not needed at this scale.
+
+
+================================================================================
+9. TOKEN COUNTING AND COST ESTIMATION
+================================================================================
+
+models.py carries the same two functions week1 used, plus one new one:
+
+  extract_token_usage(ai_message) - tries LangChain's usage_metadata first,
+    falls back to raw response_metadata['token_usage'], returns None if
+    neither is present (some providers omit it).
+
+  estimate_tokens(text) - len(text) // 4, the same rough heuristic as
+    week1 (~1 token per 4 characters). Used in app.py's `done` event so
+    the SSE stream reports an approximate token count even for providers
+    that don't return real usage numbers mid-stream.
+
+  estimate_cost_usd(model_name, prompt_tokens, completion_tokens) - NEW
+    this week. Looks up (input, output) $/1M-token pricing from
+    config.MODEL_PRICING_USD_PER_MILLION (empty by default, since every
+    model this project uses is free) and computes cost =
+    (prompt_tokens/1e6)*input_price + (completion_tokens/1e6)*output_price.
+    With no pricing configured it correctly returns $0.00 - the function
+    exists to show the TECHNIQUE (this is exactly how you'd track spend
+    against a paid model in production: multiply real usage numbers by
+    published per-token pricing, roll it up per request or per user), not
+    to compute a real bill for models that cost nothing.
+
+WHY THIS MATTERS IN A REAL SYSTEM, EVEN THOUGH IT'S $0 HERE:
+  Token usage is the unit every provider bills on, and it's also a proxy
+  for latency and context-window pressure. A production integration logs
+  it on every call (like extraction.py does: `tokens={usage}` in the log
+  line) so you can answer "why did this request take 20 seconds" or "why
+  did our bill spike Tuesday" from logs instead of guessing.
+
+
+================================================================================
+10. ASYNC API USAGE - WHY IT ACTUALLY HELPS
+================================================================================
+
+MEASURED RESULT (sync_vs_async.py, 6 prompts, nvidia/nemotron-3-nano-30b-a3b:free,
+async concurrency = 3):
+
+  Mode    Total (s)   Avg latency (s)   Throughput (req/s)   Peak mem (MB)
+  sync    25.47        4.12               0.236                 119.4
+  async   7.07         2.49               0.848                 120.6
+
+  -> async finished 3.60x faster in wall-clock time. Peak memory barely moved.
+
+WHY, MECHANICALLY:
+  Each LLM call spends almost all of its time WAITING - for OpenRouter to
+  route the request, for the backend model to generate, for the response
+  to travel back. The actual CPU work our process does (building the
+  request, parsing the response) is milliseconds. That makes this an
+  I/O-BOUND workload, not a CPU-bound one.
+
+  SYNC: chat.invoke() blocks the entire thread until the response returns.
+  While waiting, the CPU (and the rest of the program) does literally
+  nothing else. Six calls back-to-back = the sum of six wait times.
+
+  ASYNC: chat.ainvoke() is a coroutine. `await`ing it doesn't block the
+  thread - it suspends THIS coroutine and hands control back to the event
+  loop, which can start another coroutine's request in the meantime. With
+  asyncio.gather() launching all 6 and a semaphore capping how many are
+  "in flight" at once (3 here), the WAITING TIME OVERLAPS across requests
+  instead of stacking up. Total time approaches (total work) / (concurrency),
+  not the sum of every individual wait.
+
+  Note: this only helps because of Python's GIL setup for I/O - during an
+  await on network I/O, the GIL is released, so this isn't "faking"
+  parallelism, real overlapping network waits are happening. It would NOT
+  help nearly as much for CPU-bound work (e.g. heavy local text processing
+  between calls) - asyncio doesn't give you multiple CPU cores; for that
+  you'd want multiprocessing instead.
+
+WHY PEAK MEMORY BARELY CHANGED:
+  Both modes hold the same amount of data at any moment - one prompt's
+  request/response at a time in sync, up to `ASYNC_CONCURRENCY` (3) small
+  request/response objects at a time in async. That's a small, bounded
+  difference; nowhere near enough to show up as a meaningfully different
+  peak RSS for a benchmark this size. Memory isn't the axis this technique
+  optimizes - wall-clock time under I/O wait is.
+
+WHY THE SEMAPHORE MATTERS:
+  Without it, asyncio.gather(*(call(p) for p in PROMPTS)) would fire all 6
+  requests at once. At 6 prompts that's still under the free tier's 20/min
+  cap today, but the pattern doesn't scale - with more prompts, unbounded
+  concurrency risks a burst of 429s. Capping concurrency is the async
+  equivalent of week1's REQUEST_DELAY_SECONDS: a simple, honest way to
+  respect a rate limit without a full token-bucket implementation.
+
+
+================================================================================
+11. PROMPT TEMPLATES (ChatPromptTemplate)
+================================================================================
+
+Week1 kept prompts as plain strings/f-strings in config.py and explicitly
+noted ChatPromptTemplate was the natural next step "the moment you have
+reusable prompts with variables." Both of week2's exercises DO have that -
+a fixed system instruction plus a variable payload - so this project
+actually uses it (prompts.py):
+
+  stream_prompt_template = ChatPromptTemplate.from_messages([
+      ("system", STREAM_SYSTEM_PROMPT),
+      ("human", "{question}"),
+  ])
+  ...
+  messages = stream_prompt_template.format_messages(question=question)
+
+`.format_messages(**kwargs)` returns a list of proper LangChain message
+objects (SystemMessage, HumanMessage) - not a single formatted string -
+which is exactly the shape `chat.astream()` / `chat.ainvoke()` expect, and
+exactly why ChatPromptTemplate exists instead of just using
+str.format()/f-strings: it produces role-tagged messages, not flat text.
+
+extraction_prompt_template goes one step further, embedding a second
+template variable ({format_instructions}) that isn't hardcoded but is
+GENERATED by PydanticOutputParser.get_format_instructions() at call time -
+composition of two separate LangChain pieces (a prompt template and an
+output parser) into one request, which is the small-scale version of the
+LCEL chaining idea (prompt | model | parser) week1's notes described but
+didn't use.
+
+
+================================================================================
+12. KEY VOCABULARY
+================================================================================
+
+  SSE                Server-Sent Events; one-way HTTP streaming, text/event-stream
+  StreamingResponse   FastAPI response type that writes an iterator's output
+                      incrementally instead of buffering the whole body
+  Async generator     a function using `yield` inside `async def`; produces
+                      values one at a time without blocking the event loop
+  is_disconnected()   Starlette/FastAPI check for whether the client left
+  JSON mode           response_format={"type":"json_object"} - guarantees
+                      syntactically valid JSON, not schema-correct JSON
+  PydanticOutputParser  parses + validates model output against a Pydantic
+                      schema; raises on mismatch instead of passing it through
+  Reject and retry    on invalid output, discard it and ask again (bounded
+                      attempts), rather than accepting malformed data
+  Tool/function calling  model emits a structured "call this function with
+                      these args" request instead of prose; caller executes it
+  bind_tools()        LangChain method attaching tool schemas to a chat model
+  Exponential backoff  increasing wait time between retries (1s, 2s, 4s...)
+                      so repeated failures don't hammer a struggling service
+  Transport error     the request itself failed (network/429/5xx), as
+                      opposed to a schema/validation error on a successful reply
+  Token usage         count of input + output tokens a call consumed;
+                      what providers actually bill on
+  Cost estimation     usage * published $/token pricing = estimated spend
+  I/O-bound           a task spends most of its time waiting (network/disk),
+                      not computing - the case async concurrency helps most
+  asyncio.gather()    runs multiple coroutines concurrently, returns all results
+  asyncio.Semaphore   caps how many coroutines run a section of code at once
+  Throughput          completed requests / total time
+  ChatPromptTemplate  LangChain object that formats role-tagged messages
+                      (system/human/ai) from a template + variables
+
+
+================================================================================
+13. KEY TAKEAWAYS
+================================================================================
+
+  1. SSE is plain HTTP kept open, written to incrementally - not a special
+     protocol. `data:` + blank line is the entire wire format.
+  2. Async generators (`async def` + `yield`) let FastAPI stream a
+     response as it's produced, without blocking the event loop between
+     chunks - critical for serving multiple concurrent streaming requests.
+  3. Check for client disconnects INSIDE the streaming loop, not just once
+     - real disconnects happen mid-response, and catching them promptly
+     saves wasted generation.
+  4. Structured output in practice is layered: JSON mode guarantees
+     syntax, schema validation (Pydantic) guarantees shape - one without
+     the other still lets bad data through.
+  5. Two different failures need two different retries: transport errors
+     want exponential backoff on the SAME request; validation failures
+     want a fresh attempt with NO backoff, since waiting doesn't fix a
+     bad answer.
+  6. Function/tool calling is a fine-tuned behavior, not a prompting
+     trick - the model requests a call, your code executes it, the result
+     goes back in as a new message.
+  7. Token usage is what providers bill on; log it on every call so cost
+     and latency questions can be answered from logs, not guessed at.
+  8. Async wins for I/O-bound work (waiting on a network response) because
+     waiting time overlaps across concurrent requests - measured 3.6x
+     throughput here with concurrency 3, bounded by a semaphore to respect
+     rate limits.
+  9. ChatPromptTemplate is worth using the moment a prompt has both a
+     fixed system instruction and a variable payload - which is most real
+     prompts, and both of this week's exercises.
+  10. One run is still a sample, not ground truth (see week1's notes) -
+      the numbers in this file are one real measured run, useful as a
+      concrete example, not a guaranteed constant across every run.
+
+================================================================================
+END OF NOTES
+================================================================================

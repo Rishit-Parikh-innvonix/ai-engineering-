@@ -1,0 +1,10 @@
+langchain
+langchain-openai
+python-dotenv
+rich
+fastapi
+uvicorn[standard]
+httpx
+email-validator
+tenacity
+psutil

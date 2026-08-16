@@ -1,0 +1,149 @@
+Week 2 (JS) - Learning Notes
+=============================
+
+This is the JS/TypeScript replica of week2/LEARNING_NOTES.txt. It assumes
+you've already read that file (or the in-chat walkthroughs of week2/app.py)
+and focuses specifically on what changes - and what doesn't - when the same
+three exercises are built with Node.js + Express + LangChain.js instead of
+Python + FastAPI + LangChain.
+
+1. The concepts are identical; only the plumbing differs
+----------------------------------------------------------
+SSE is a wire format, not a Python or FastAPI feature - it's just
+"event: ...\ndata: ...\n\n" lines over a plain HTTP response, and any server
+that can write raw bytes onto an open HTTP connection can produce it.
+Structured-output validation is just "parse then check shape" - it doesn't
+care whether the checker is Pydantic or zod. Concurrency via async/await is
+the same "don't block on I/O wait" idea whether the runtime is Python's
+asyncio event loop or Node's libuv event loop. Nothing about *what* week2
+teaches is Python-specific - only *how it's expressed* changes.
+
+2. Node's event loop vs Python's asyncio event loop
+------------------------------------------------------
+Python is single-threaded by default and needs `async def` / `await` /
+`asyncio.run()` to opt into non-blocking I/O - a plain function call blocks.
+Node.js is single-threaded too, but its I/O model is async *by default*:
+`fetch()`, file reads, and (via LangChain.js) HTTP calls to OpenRouter all
+return Promises and never block the event loop, even without you writing
+`async`. This is why `chat.invoke(prompt)` in models.ts always returns a
+Promise you must `await` - there's no "sync" version of it to accidentally
+call blockingly, unlike Python where `chat.invoke()` (sync) and
+`chat.ainvoke()` (async) are genuinely two different code paths.
+
+3. FastAPI's StreamingResponse vs Express's res.write()
+-----------------------------------------------------------
+Python:
+    async def _stream_events(...):
+        yield "event: start\ndata: ...\n\n"
+        async for chunk in chat.astream(messages):
+            yield f"data: {json.dumps(...)}\n\n"
+    return StreamingResponse(_stream_events(...), media_type="text/event-stream")
+
+FastAPI's StreamingResponse is a small adapter: give it something you can
+iterate over (here, an async generator), and it pulls values out one at a
+time and writes each straight onto the socket.
+
+JS (app.ts):
+    res.write(`event: start\ndata: ...\n\n`);
+    for await (const chunk of tokenStream) {
+        res.write(`data: ${JSON.stringify(...)}\n\n`);
+    }
+    res.end();
+
+Express has no built-in streaming-response abstraction, so the JS version
+just calls `res.write()` directly, as many times as needed, and calls
+`res.end()` itself when finished (FastAPI does this "end the response"
+step for you automatically when the generator finishes). Functionally
+identical outcome, one layer of abstraction removed.
+
+4. Detecting a client disconnect
+-------------------------------------
+Python: `await request.is_disconnected()` - checked explicitly inside the
+loop, once per chunk, because FastAPI doesn't interrupt your code
+automatically when the client leaves.
+
+JS: `res.on("close", () => { disconnected = true; })` registered once,
+before streaming starts. Node's HTTP module *pushes* the disconnect
+notification to you via an event, rather than you having to *poll* for it.
+app.ts's stream loop still checks a `disconnected` flag every iteration
+(via the `isDisconnected()` closure passed into `streamEvents`) for the
+same reason Python does: to stop calling into the model / writing to a
+dead socket as soon as possible, not just eventually.
+
+5. LangChain.js's astream vs LangChain's astream
+-----------------------------------------------------
+`chat.stream(messages)` in LangChain.js does the same job as `chat.astream()`
+in Python LangChain: an async, token-by-token generator over the model's
+own SSE stream from OpenRouter. One JS-specific wrinkle: LangChain.js's
+`.stream()` method is itself asynchronous - it returns a Promise that
+resolves to the actual async-iterable stream - so you write
+`for await (const chunk of await chat.stream(messages))`, not just
+`for await (const chunk of chat.stream(messages))`. Forgetting the extra
+`await` is a common mistake and produces a TypeScript error, not a silent
+bug, since `.stream()`'s return type is `Promise<IterableReadableStream<...>>`.
+
+6. Pydantic vs zod
+-----------------------
+Both are runtime schema-validation libraries with a similar shape:
+  Pydantic:  BaseModel + Field(description=...) + Literal[...] for enums
+  zod:       z.object({...}) + .describe(...) + z.enum([...]) for enums
+Both throw a structured error (ValidationError / ZodError) when the data
+doesn't match, which extraction.ts and extraction.py both catch to trigger
+a retry rather than let bad data through. The one real difference: Pydantic
+can *generate* a "format instructions" string automatically from the model
+class (via PydanticOutputParser.get_format_instructions()); this project's
+zod version writes that instruction string out by hand in extraction.ts's
+getFormatInstructions() instead of relying on a library helper, since
+LangChain.js's zod-based structured-output helpers assume you're using
+`.withStructuredOutput()` (a different, tool-calling-based technique) rather
+than the explicit JSON-mode + parse-and-validate technique this project
+deliberately uses to match the Python version step for step.
+
+7. tenacity vs a hand-written retry loop
+---------------------------------------------
+Python's `@retry(...)` decorator from tenacity wraps a function and retries
+it automatically according to a declarative policy (stop_after_attempt,
+wait_exponential, retry_if_exception_type). JS has no equivalent standard,
+decorator-based retry library in common use for this kind of code, so
+models.ts's `ainvokeWithRetry` writes the same policy out as an explicit
+for-loop with `Math.min(8000, 1000 * 2 ** (attempt - 1))` for the backoff
+delay - mechanically the same exponential-backoff formula tenacity uses
+under the hood, just visible instead of hidden behind a decorator.
+
+8. asyncio.Semaphore + asyncio.gather vs a hand-written Semaphore + Promise.all
+------------------------------------------------------------------------------------
+Python's asyncio ships a Semaphore class in its standard library. Node's
+built-in `util` / `stream` modules don't include an equivalent primitive for
+capping concurrent async operations, so syncVsAsync.ts implements a small
+`Semaphore` class itself (an `available` counter plus a queue of "waiting"
+resolvers) to reproduce the exact same behavior: at most N calls in flight
+at once, everything else queued until a slot frees up. `Promise.all(...)` is
+the direct JS analog of `asyncio.gather(...)` - both take a collection of
+already-started concurrent operations and resolve once every one of them
+has finished (or reject on the first failure, in JS's case - which is why
+each `call()` in syncVsAsync.ts catches its own errors and returns a result
+object instead of throwing, exactly like the Python version does).
+
+9. Why async was ~7x faster here, concretely
+--------------------------------------------------
+Verified locally: 6 prompts, same free OpenRouter model, concurrency capped
+at 3. Sequential (sync) took 15.71s total (each of 6 calls waits for the
+previous one to fully finish - mostly waiting on OpenRouter's network
+response, doing nothing else while it waits). Concurrent (async) took 2.11s
+total - a 7.45x speedup - because up to 3 requests were in flight on the
+network at once, and Node's event loop could start request 2 the instant
+request 1 handed off to the network, rather than sitting idle. Peak memory
+was nearly identical (82.1MB vs 84.7MB) because the actual work - holding a
+handful of prompt/response strings in memory - is tiny; the bottleneck this
+whole exercise is designed to expose is network latency, not memory or CPU,
+and concurrency only helps with the former.
+
+10. TypeScript's role here
+-------------------------------
+TypeScript isn't adding new runtime behavior over plain JS - `tsx` strips
+the types and runs the resulting JS directly, no separate build step during
+development. What it buys: the zod schema (schemas.ts) automatically
+produces a TypeScript type (`SupportTicket`) via `z.infer<...>`, so
+extraction.ts's return value is type-checked against the same schema used
+for runtime validation - one definition, two guarantees (compile-time shape
+checking *and* runtime validation), instead of maintaining them separately.
