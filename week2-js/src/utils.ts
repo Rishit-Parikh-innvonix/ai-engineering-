@@ -1,39 +1,7 @@
 import Table from "cli-table3";
 import chalk from "chalk";
 
-// JS stand-in for week2/utils.py's rich-based table/panel printers. cli-table3 +
-// chalk play the same role here that rich's Table/Panel play in the Python version.
-
-export interface BenchmarkSummary {
-  mode: string;
-  total_seconds: number;
-  avg_latency_seconds: number;
-  throughput_per_second: number;
-  successes: number;
-  errors: number;
-  peak_memory_mb: number;
-}
-
-export function printBenchmarkTable(syncSummary: BenchmarkSummary, asyncSummary: BenchmarkSummary): void {
-  const table = new Table({
-    head: ["Mode", "Total time (s)", "Avg latency (s)", "Throughput (req/s)", "Successes", "Errors", "Peak memory (MB)"],
-  });
-
-  for (const summary of [syncSummary, asyncSummary]) {
-    table.push([
-      summary.mode,
-      String(summary.total_seconds),
-      String(summary.avg_latency_seconds),
-      String(summary.throughput_per_second),
-      String(summary.successes),
-      String(summary.errors),
-      String(summary.peak_memory_mb),
-    ]);
-  }
-
-  console.log(chalk.bold.cyan("\nExercise 3: Sync vs Async Throughput"));
-  console.log(table.toString());
-}
+// JS stand-in for a rich-based table/panel printer.
 
 export function printPanel(title: string, text: string): void {
   const width = Math.min(100, Math.max(title.length, ...text.split("\n").map((line) => line.length)) + 4);
@@ -45,4 +13,15 @@ export function printPanel(title: string, text: string): void {
     console.log(chalk.cyan("│ ") + line);
   }
   console.log(chalk.cyan(`└${border}┘`));
+}
+
+/** Generic labeled-rows comparison table - used by invocationMethodsDemo.ts (timing across
+ * invoke/stream/concurrent modes) and reviewAnalysisPipeline.ts (parser vs withStructuredOutput). */
+export function printComparisonTable(title: string, head: string[], rows: (string | number)[][]): void {
+  const table = new Table({ head });
+  for (const row of rows) {
+    table.push(row.map((cell) => String(cell)));
+  }
+  console.log(chalk.bold.cyan(`\n${title}`));
+  console.log(table.toString());
 }

@@ -1,14 +1,12 @@
-# Week 2 (JS) - Working with LLM APIs
+# Week 2 (JS) - LangChain Fundamentals
 
-A TypeScript/Node.js replica of [`week2/`](../week2), built with **Express** and
-**LangChain.js** instead of FastAPI and Python LangChain. Same three exercises,
-same OpenRouter models, same prompts, same schema - different runtime. The goal
-is to see the exact same concepts (SSE streaming, structured extraction with
-reject/retry, sync vs async throughput) expressed in JavaScript's async model
-instead of Python's, so you can compare the two side by side.
+Three exercises exploring LangChain.js fundamentals: reusable prompt templates,
+the different ways to invoke a chat model (invoke/stream, and their concurrent
+equivalents), and an end-to-end structured-output pipeline built with LCEL
+Runnables/Chains.
 
-The Python version (`week2/`) is untouched - this is a separate, independent
-project living in its own folder with its own `package.json` and `.env`.
+All exercises run through **OpenRouter** with a single API key, using a
+free-tier GPT-OSS model. See `src/config.ts` for the exact model ID.
 
 ## Setup
 
@@ -17,119 +15,100 @@ cd week2-js
 npm install
 ```
 
-Copy `.env.example` to `.env` and put your OpenRouter key in it (a `.env`
-already exists in this folder for this repo's own testing - see
-`week2/README.md` for why the key is safe to have locally but must never be
-committed).
-
-## Running Exercise 1 (SSE streaming)
-
-Terminal 1 - start the server:
+Copy `.env.example` to `.env` and put your OpenRouter key in it:
 ```
-npm run dev
-```
-Wait for `Uvicorn's Express equivalent running on http://127.0.0.1:8000`.
-
-Terminal 2 - run the client:
-```
-npm run stream-client -- "What is a race condition?"
+OPENROUTER_API_KEY=your_key_here
 ```
 
-Or just open `http://127.0.0.1:8000/ask/stream?question=hello` in a browser -
-most browsers render SSE `data:` lines directly.
+## Exercise 1 - Prompt Templates
 
-Verified live output (npm run stream-client, question "Say hello in five words"):
-```
-event: start
-data: {"request_id":"cc49d597","model":"openai/gpt-oss-20b:free"}
-
-data: {"token":"Hey"}
-data: {"token":" there"}
-...
-event: done
-data: {"elapsed_seconds":8.1,"chunks":8,"characters":34}
-```
-
-## Running Exercise 2 (structured extraction)
-
-With the server running:
-```
-curl -X POST http://127.0.0.1:8000/extract \
-  -H "Content-Type: application/json" \
-  -d '{"email_text": "Subject: cant login\n\nHi, this is Alex Kim (alex.kim@example.com). Getting invalid password error since this morning, need this fixed urgently for a demo."}'
-```
-
-Or run the standalone demo (no server needed) against the 3 sample emails in `src/config.ts`:
-```
-npm run extraction-demo
-```
-
-Verified live run - all 3 sample emails extracted correctly on the first attempt:
-- Priya Shah / priya.shah@example.com / **urgent** / **technical** - login blocked before a client demo
-- Daniel Cho / daniel.cho99@example.com / **low** / **billing** - duplicate charge, not urgent
-- Marta / marta.k@example.com / **low** / **feature_request** - dark mode suggestion
-
-## Running Exercise 3 (sync vs async benchmark)
+Builds two reusable `ChatPromptTemplate`s - one formatted with different
+`{topic}`/`{audience}` pairs, one built with `.partial()` to fix a `{style}`
+value ahead of time - and shows the same template producing different outputs
+without rewriting the prompt string per call.
 
 ```
-npm run benchmark
+npm run prompt-templates-demo
 ```
 
-Verified live run (6 prompts, `nvidia/nemotron-3-nano-30b-a3b:free`, concurrency 3):
+## Exercise 2 - Model Invocation Methods
 
-| Mode  | Total time (s) | Avg latency (s) | Throughput (req/s) | Peak memory (MB) |
-|-------|-----------------|------------------|----------------------|--------------------|
-| sync  | 15.71           | 2.62             | 0.382                | 82.1               |
-| async | 2.11            | 0.93             | 2.844                | 84.7               |
+Compares `invoke()`, `stream()`, and their concurrent equivalents. LangChain.js
+has no real sync/async split the way Python does (every call already returns a
+Promise), so "ainvoke()"/"astream()" are demonstrated as the same `invoke()`/
+`stream()` calls fired concurrently via `Promise.all` instead of sequentially -
+same behavior Python shows through separate methods, expressed in JS through
+sequential-vs-concurrent await. Prints a timing comparison table.
 
-Async finished **7.45x faster** in wall-clock time. Peak memory stayed flat
-between the two modes, same as the Python version - the win is entirely from
-overlapping network wait time, not from doing less work or using less memory.
+```
+npm run invocation-demo
+```
+
+## Exercise 3 - Review Analysis Pipeline
+
+Runs 10 human-written product reviews through an LCEL `RunnableSequence`
+(prompt -> model -> parser) that extracts `{sentiment, key_issues, summary}`
+as structured JSON, validated against a zod schema (`src/schemas.ts`). Two
+implementations of the same chain shape are run and compared:
+
+- **A**: `prompt.pipe(model.withStructuredOutput(schema))` - LangChain manages
+  format instructions and JSON parsing/validation internally.
+- **B**: `prompt.pipe(model).pipe(StructuredOutputParser)` - format
+  instructions are injected into the prompt explicitly, and the parser step
+  turns raw text into validated JSON.
+
+Results from both are saved to `output/review_analysis_with_structured_output.json`
+and `output/review_analysis_with_output_parser.json`, and a comparison table
+(success rate, total time, avg time/review) is printed to the console.
+
+```
+npm run review-pipeline
+```
 
 ## Bonus: tool/function calling demo
 
 ```
 npm run tool-calling-demo
 ```
-Shows the model requesting `lookup_priority_policy`, the code executing it
-locally, and the result being fed back for a final answer - same 4-step loop
-as `week2/tool_calling_demo.py`.
+Shows the model requesting `lookup_priority_policy`/`lookup_plan_sla`, the
+code executing them locally, and the results being fed back for a final
+answer - unchanged from the previous version of this project.
+
+## Bonus: chain basics demo
+
+```
+npm run chain-basics-demo
+```
+The simplest possible LCEL chain (prompt -> model -> `StringOutputParser`),
+with no schema or structured output involved - isolates what "a chain" is
+before Exercise 3 layers structured output on top.
+
+## Bonus: structured output + streaming demo
+
+```
+npm run structured-streaming-demo
+```
+Combines `.stream()` with structured output and shows the two implementations
+behave differently: `withStructuredOutput()` (tool-calling based) typically
+delivers the whole object in one chunk, not incrementally, while streaming the
+plain-text model call directly shows genuine token-by-token output - which
+then has to be fully buffered before it can be parsed into valid JSON.
 
 ## Project layout
 
 ```
 week2-js/
   src/
-    config.ts          same models/prompts/sample data as week2/config.py
-    schemas.ts          zod SupportTicket schema (replaces Pydantic)
-    prompts.ts           ChatPromptTemplate definitions (LangChain.js)
-    models.ts            ChatOpenAI factory functions + retry + token helpers
-    extraction.ts         Exercise 2: JSON-mode + zod validate + retry loop
-    app.ts                Express server: Exercise 1 (SSE) + Exercise 2 (POST /extract)
-    streamClient.ts        Exercise 1 test client (fetch + ReadableStream)
-    extractionDemo.ts      Exercise 2 standalone demo (no server needed)
-    syncVsAsync.ts          Exercise 3: sequential vs Promise.all benchmark
-    toolCallingDemo.ts      bonus: bind_tools-equivalent function calling demo
+    config.ts                  models, sample reviews, invocation-demo prompts
+    schemas.ts                  zod ReviewAnalysis schema
+    prompts.ts                   ChatPromptTemplate definitions (LangChain.js)
+    models.ts                    ChatOpenAI factory functions + transport retry
+    utils.ts                     console table/panel printers
+    promptTemplateDemo.ts         Exercise 1: reusable ChatPromptTemplate demo
+    invocationMethodsDemo.ts       Exercise 2: invoke/stream/concurrent comparison
+    reviewAnalysisPipeline.ts       Exercise 3: LCEL structured-output pipeline
+    toolCallingDemo.ts               bonus: bind_tools-equivalent function calling demo
+    chainBasicsDemo.ts               bonus: simplest possible LCEL chain
+    structuredOutputStreamingDemo.ts bonus: structured output + streaming comparison
+  output/                         JSON results from the review analysis pipeline (gitignored)
 ```
-
-## What's different from the Python version, and why
-
-See `LEARNING_NOTES.txt` for the deep dive. Short version:
-
-- **FastAPI's `StreamingResponse` + async generator** becomes **Express +
-  `res.write()` in a loop**. Node doesn't have Python's `yield`-based generator
-  streaming builtin to its web framework, so the JS version writes to the
-  response stream directly and calls `res.end()` when done.
-- **`request.is_disconnected()`** becomes listening for the **`'close'` event**
-  on the Express `res` object - same idea (detect the client walking away
-  mid-stream), different API.
-- **Pydantic + `PydanticOutputParser`** becomes **zod + `.parse()`** - same
-  two-layer validation idea (JSON-mode for syntax, schema validation for
-  shape/enums), same reject-and-retry loop.
-- **`tenacity`'s `@retry` decorator** becomes a **hand-written retry loop**
-  (`models.ts`'s `ainvokeWithRetry`) - JS has no widely-used decorator-based
-  retry in the way Python does, so the backoff logic is written out explicitly.
-- **`asyncio.Semaphore` + `asyncio.gather`** becomes a **hand-written
-  `Semaphore` class + `Promise.all`** - conceptually identical (bound
-  concurrency, wait for all results), same reasoning: Node's single-threaded
-  event loop overlaps I/O-bound waits exactly like Python's asyncio does.

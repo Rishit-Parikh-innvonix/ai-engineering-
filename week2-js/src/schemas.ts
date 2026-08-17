@@ -1,18 +1,16 @@
 import { z } from "zod";
 
-// JS/zod equivalent of week2/schemas.py's SupportTicket (Pydantic). Field-level
-// .describe() calls feed the format instructions in extraction.ts, the same way
-// Pydantic's Field(description=...) feeds PydanticOutputParser in the Python version.
-export const SupportTicketSchema = z.object({
-  customer_name: z.string().describe("Full name of the customer, or 'Unknown' if not stated in the email"),
-  customer_email: z.string().email().describe("The customer's email address exactly as written in the message"),
-  priority: z
-    .enum(["low", "medium", "high", "urgent"])
-    .describe("Urgency of the issue, judged from tone and content"),
-  issue_type: z
-    .enum(["billing", "technical", "account", "feature_request", "bug", "other"])
-    .describe("Category that best describes the issue"),
-  summary: z.string().describe("A one to two sentence summary of the customer's issue"),
+// Exercise 3: zod equivalent of a Pydantic review-analysis model. Field-level
+// .describe() calls double as the format instructions fed to StructuredOutputParser
+// in the second pipeline implementation (see reviewAnalysisPipeline.ts).
+export const ReviewAnalysisSchema = z.object({
+  sentiment: z
+    .enum(["positive", "negative", "neutral", "mixed"])
+    .describe("Overall sentiment of the review"),
+  key_issues: z
+    .array(z.string())
+    .describe("Specific problems, complaints, or standout concerns raised in the review; empty array if none"),
+  summary: z.string().describe("A one to two sentence summary of what the reviewer said"),
 });
 
-export type SupportTicket = z.infer<typeof SupportTicketSchema>;
+export type ReviewAnalysis = z.infer<typeof ReviewAnalysisSchema>;

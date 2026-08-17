@@ -1,149 +1,107 @@
 Week 2 (JS) - Learning Notes
 =============================
 
-This is the JS/TypeScript replica of week2/LEARNING_NOTES.txt. It assumes
-you've already read that file (or the in-chat walkthroughs of week2/app.py)
-and focuses specifically on what changes - and what doesn't - when the same
-three exercises are built with Node.js + Express + LangChain.js instead of
-Python + FastAPI + LangChain.
+Three exercises on LangChain.js fundamentals: reusable prompt templates, the
+different ways to invoke a chat model, and an end-to-end structured-output
+pipeline built with LCEL Runnables/Chains. All three go through OpenRouter
+with a single API key, using a free-tier GPT-OSS model (see config.ts).
 
-1. The concepts are identical; only the plumbing differs
+1. ChatPromptTemplate is a template object, not a string
 ----------------------------------------------------------
-SSE is a wire format, not a Python or FastAPI feature - it's just
-"event: ...\ndata: ...\n\n" lines over a plain HTTP response, and any server
-that can write raw bytes onto an open HTTP connection can produce it.
-Structured-output validation is just "parse then check shape" - it doesn't
-care whether the checker is Pydantic or zod. Concurrency via async/await is
-the same "don't block on I/O wait" idea whether the runtime is Python's
-asyncio event loop or Node's libuv event loop. Nothing about *what* week2
-teaches is Python-specific - only *how it's expressed* changes.
+`ChatPromptTemplate.fromMessages([...])` (prompts.ts) is built once and
+formatted many times via `.formatMessages({...})`, which returns the actual
+`BaseMessage[]` array `chat.invoke()` expects. The payoff shows up in
+promptTemplateDemo.ts: the same `explainerPromptTemplate` is formatted with
+three different `{topic}/{audience}` pairs without ever touching a prompt
+string by hand. `.partial({...})` goes one step further - it returns a *new*
+template with some variables pre-filled (`reviewRewritePromptTemplateBase`
+fixes `{style}`, leaving only `{review}` to supply later), which is the
+LangChain equivalent of currying a function over one of its arguments.
 
-2. Node's event loop vs Python's asyncio event loop
-------------------------------------------------------
-Python is single-threaded by default and needs `async def` / `await` /
-`asyncio.run()` to opt into non-blocking I/O - a plain function call blocks.
-Node.js is single-threaded too, but its I/O model is async *by default*:
-`fetch()`, file reads, and (via LangChain.js) HTTP calls to OpenRouter all
-return Promises and never block the event loop, even without you writing
-`async`. This is why `chat.invoke(prompt)` in models.ts always returns a
-Promise you must `await` - there's no "sync" version of it to accidentally
-call blockingly, unlike Python where `chat.invoke()` (sync) and
-`chat.ainvoke()` (async) are genuinely two different code paths.
+2. LangChain.js has no invoke()/ainvoke() split - only invoke()/stream()
+------------------------------------------------------------------------------
+Python LangChain has four real, distinct methods: invoke() (blocking),
+ainvoke() (awaited coroutine), stream() (blocking generator), astream()
+(async generator). LangChain.js only has two: `.invoke()` and `.stream()`,
+and both already return a Promise / Promise<AsyncIterable> - there's no
+"blocking" version to accidentally call synchronously, because JS has no
+such thing as a blocking network call in the first place. invocationMethodsDemo.ts
+handles this by demonstrating the *behavior* Python's ainvoke()/astream() are
+for - concurrent, non-blocking calls - as the same invoke()/stream() calls
+fired via `Promise.all` instead of awaited one at a time in a loop. The
+comparison that matters isn't "which method did I call" (JS only offers one
+per behavior), it's "did I await each call before starting the next, or let
+them all run concurrently."
 
-3. FastAPI's StreamingResponse vs Express's res.write()
------------------------------------------------------------
-Python:
-    async def _stream_events(...):
-        yield "event: start\ndata: ...\n\n"
-        async for chunk in chat.astream(messages):
-            yield f"data: {json.dumps(...)}\n\n"
-    return StreamingResponse(_stream_events(...), media_type="text/event-stream")
+3. Why concurrent invoke() is faster, mechanically
+--------------------------------------------------------
+Each `chat.invoke(prompt)` call is I/O-bound: almost all of its wall-clock
+time is spent waiting on OpenRouter's network response, not doing local CPU
+work. Sequential invoke() calls wait for that response before starting the
+next request, so total time is roughly the sum of every individual latency.
+Concurrent invoke() calls (via `Promise.all`, capped by the hand-written
+`Semaphore` class in invocationMethodsDemo.ts, the JS analog of Python's
+`asyncio.Semaphore`) start the next request the instant the previous one
+hands off to the network, so total time approaches the *slowest single
+request* rather than the *sum of all of them*. This is the same reasoning
+week2's original sync-vs-async benchmark demonstrated, now folded into the
+invocation-methods exercise instead of being a separate one.
 
-FastAPI's StreamingResponse is a small adapter: give it something you can
-iterate over (here, an async generator), and it pulls values out one at a
-time and writes each straight onto the socket.
+4. LCEL / Runnables: `.pipe()` and `RunnableSequence.from([...])`
+------------------------------------------------------------------------
+reviewAnalysisPipeline.ts builds two chains, both shaped
+`prompt -> model -> (something that produces structured output)`:
+  RunnableSequence.from([reviewAnalysisPromptTemplate, structuredChat])
+  RunnableSequence.from([reviewAnalysisWithFormatInstructionsPromptTemplate, chat, parser])
+Every step in the sequence is a `Runnable` - something with a uniform
+`.invoke(input)` interface - so `RunnableSequence` just feeds each step's
+output as the next step's input, ending with whatever the last step
+returns. This is the same idea as Python's LCEL `prompt | model | parser`
+syntax; LangChain.js just spells composition as `RunnableSequence.from([...])`
+(or `.pipe()` chained off any single Runnable) instead of overloading `|`.
 
-JS (app.ts):
-    res.write(`event: start\ndata: ...\n\n`);
-    for await (const chunk of tokenStream) {
-        res.write(`data: ${JSON.stringify(...)}\n\n`);
-    }
-    res.end();
+5. Two ways to get structured output, and the actual tradeoff
+------------------------------------------------------------------
+Implementation A - `model.withStructuredOutput(schema)`: LangChain generates
+the format instructions and handles parsing/validation for you, usually via
+tool-calling under the hood. Less code, less visibility into what's actually
+being sent to the model or how the raw reply gets turned into JSON.
+Implementation B - `StructuredOutputParser.fromZodSchema(schema)`: you inject
+`parser.getFormatInstructions()` into the prompt yourself
+(reviewAnalysisWithFormatInstructionsPromptTemplate), the model replies with
+text, and the parser step turns that text into validated JSON. More code,
+but every step (what instructions were given, what came back, how it was
+validated) is visible and swappable. Both are run over the same 10 reviews
+in reviewAnalysisPipeline.ts specifically so their success rate and timing
+can be compared side by side rather than assumed equivalent.
 
-Express has no built-in streaming-response abstraction, so the JS version
-just calls `res.write()` directly, as many times as needed, and calls
-`res.end()` itself when finished (FastAPI does this "end the response"
-step for you automatically when the generator finishes). Functionally
-identical outcome, one layer of abstraction removed.
+6. zod schema -> TypeScript type in one definition
+----------------------------------------------------------
+`ReviewAnalysisSchema` (schemas.ts) is a runtime validator (`.parse()`
+throws a ZodError on a shape mismatch) *and*, via `z.infer<typeof
+ReviewAnalysisSchema>`, a compile-time TypeScript type (`ReviewAnalysis`).
+One definition gives two guarantees - the pipeline's return type is checked
+against the exact same schema used to validate the model's actual JSON reply
+at runtime - instead of maintaining a hand-written interface that could
+silently drift from the validation logic.
 
-4. Detecting a client disconnect
--------------------------------------
-Python: `await request.is_disconnected()` - checked explicitly inside the
-loop, once per chunk, because FastAPI doesn't interrupt your code
-automatically when the client leaves.
+7. Retry logic is still transport-level, not schema-level, here
+------------------------------------------------------------------------
+`models.ts`'s `ainvokeWithRetry` (exponential backoff on network errors /
+429s / 5xxs) is used by reviewAnalysisPipeline.ts so one flaky free-model
+response doesn't fail the whole 10-review batch. This is deliberately
+separate from schema validation: `withStructuredOutput()` and
+`StructuredOutputParser` both throw if the model's reply doesn't match
+`ReviewAnalysisSchema`, and `runPipeline()` in reviewAnalysisPipeline.ts
+catches that per-review and records it as a failed row instead of retrying
+it - the assignment asks to *compare* the two implementations' success
+rates, so a schema failure is a data point, not something to paper over with
+a retry loop the way week2's earlier extraction exercise did.
 
-JS: `res.on("close", () => { disconnected = true; })` registered once,
-before streaming starts. Node's HTTP module *pushes* the disconnect
-notification to you via an event, rather than you having to *poll* for it.
-app.ts's stream loop still checks a `disconnected` flag every iteration
-(via the `isDisconnected()` closure passed into `streamEvents`) for the
-same reason Python does: to stop calling into the model / writing to a
-dead socket as soon as possible, not just eventually.
-
-5. LangChain.js's astream vs LangChain's astream
------------------------------------------------------
-`chat.stream(messages)` in LangChain.js does the same job as `chat.astream()`
-in Python LangChain: an async, token-by-token generator over the model's
-own SSE stream from OpenRouter. One JS-specific wrinkle: LangChain.js's
-`.stream()` method is itself asynchronous - it returns a Promise that
-resolves to the actual async-iterable stream - so you write
-`for await (const chunk of await chat.stream(messages))`, not just
-`for await (const chunk of chat.stream(messages))`. Forgetting the extra
-`await` is a common mistake and produces a TypeScript error, not a silent
-bug, since `.stream()`'s return type is `Promise<IterableReadableStream<...>>`.
-
-6. Pydantic vs zod
------------------------
-Both are runtime schema-validation libraries with a similar shape:
-  Pydantic:  BaseModel + Field(description=...) + Literal[...] for enums
-  zod:       z.object({...}) + .describe(...) + z.enum([...]) for enums
-Both throw a structured error (ValidationError / ZodError) when the data
-doesn't match, which extraction.ts and extraction.py both catch to trigger
-a retry rather than let bad data through. The one real difference: Pydantic
-can *generate* a "format instructions" string automatically from the model
-class (via PydanticOutputParser.get_format_instructions()); this project's
-zod version writes that instruction string out by hand in extraction.ts's
-getFormatInstructions() instead of relying on a library helper, since
-LangChain.js's zod-based structured-output helpers assume you're using
-`.withStructuredOutput()` (a different, tool-calling-based technique) rather
-than the explicit JSON-mode + parse-and-validate technique this project
-deliberately uses to match the Python version step for step.
-
-7. tenacity vs a hand-written retry loop
----------------------------------------------
-Python's `@retry(...)` decorator from tenacity wraps a function and retries
-it automatically according to a declarative policy (stop_after_attempt,
-wait_exponential, retry_if_exception_type). JS has no equivalent standard,
-decorator-based retry library in common use for this kind of code, so
-models.ts's `ainvokeWithRetry` writes the same policy out as an explicit
-for-loop with `Math.min(8000, 1000 * 2 ** (attempt - 1))` for the backoff
-delay - mechanically the same exponential-backoff formula tenacity uses
-under the hood, just visible instead of hidden behind a decorator.
-
-8. asyncio.Semaphore + asyncio.gather vs a hand-written Semaphore + Promise.all
-------------------------------------------------------------------------------------
-Python's asyncio ships a Semaphore class in its standard library. Node's
-built-in `util` / `stream` modules don't include an equivalent primitive for
-capping concurrent async operations, so syncVsAsync.ts implements a small
-`Semaphore` class itself (an `available` counter plus a queue of "waiting"
-resolvers) to reproduce the exact same behavior: at most N calls in flight
-at once, everything else queued until a slot frees up. `Promise.all(...)` is
-the direct JS analog of `asyncio.gather(...)` - both take a collection of
-already-started concurrent operations and resolve once every one of them
-has finished (or reject on the first failure, in JS's case - which is why
-each `call()` in syncVsAsync.ts catches its own errors and returns a result
-object instead of throwing, exactly like the Python version does).
-
-9. Why async was ~7x faster here, concretely
---------------------------------------------------
-Verified locally: 6 prompts, same free OpenRouter model, concurrency capped
-at 3. Sequential (sync) took 15.71s total (each of 6 calls waits for the
-previous one to fully finish - mostly waiting on OpenRouter's network
-response, doing nothing else while it waits). Concurrent (async) took 2.11s
-total - a 7.45x speedup - because up to 3 requests were in flight on the
-network at once, and Node's event loop could start request 2 the instant
-request 1 handed off to the network, rather than sitting idle. Peak memory
-was nearly identical (82.1MB vs 84.7MB) because the actual work - holding a
-handful of prompt/response strings in memory - is tiny; the bottleneck this
-whole exercise is designed to expose is network latency, not memory or CPU,
-and concurrency only helps with the former.
-
-10. TypeScript's role here
--------------------------------
-TypeScript isn't adding new runtime behavior over plain JS - `tsx` strips
-the types and runs the resulting JS directly, no separate build step during
-development. What it buys: the zod schema (schemas.ts) automatically
-produces a TypeScript type (`SupportTicket`) via `z.infer<...>`, so
-extraction.ts's return value is type-checked against the same schema used
-for runtime validation - one definition, two guarantees (compile-time shape
-checking *and* runtime validation), instead of maintaining them separately.
+8. Running it
+------------------
+Set OPENROUTER_API_KEY in `.env` first (see README.md). None of the numbers
+above are specific measured results - run `npm run invocation-demo` and
+`npm run review-pipeline` yourself to see actual timings and success rates
+for your account/network; they'll vary by model load and free-tier rate
+limits.

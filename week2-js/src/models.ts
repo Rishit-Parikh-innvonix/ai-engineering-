@@ -9,8 +9,8 @@ const DEFAULT_HEADERS = {
 };
 
 // Free OpenRouter models occasionally never respond at all (as opposed to responding with
-// an error) once a conversation gets longer - without a timeout, that call would hang the
-// process forever instead of failing in a way ainvokeWithRetry / safeInvoke can catch.
+// an error) - without a timeout, that call would hang the process forever instead of
+// failing in a way ainvokeWithRetry / safeInvoke can catch.
 const REQUEST_TIMEOUT_MS = 30_000;
 
 interface ChatModelOptions {
@@ -37,23 +37,9 @@ export function getChatModel(
 }
 
 /** Same model, with streaming: true so the provider sends the response token-by-token
- * over its own SSE connection instead of one chunk at the end (see app.ts's stream loop). */
+ * instead of one chunk at the end. Used by invocationMethodsDemo.ts's stream()/astream() runs. */
 export function getStreamingChatModel(modelName: string, temperature = 0.7): ChatOpenAI {
   return getChatModel(modelName, { temperature, streaming: true });
-}
-
-/** response_format=json_object (Level 1 structured output, see LEARNING_NOTES.txt) - tells
- * the backend the reply must be valid JSON syntax. Combined in extraction.ts with a zod
- * .parse() call (Level 4) that checks the JSON actually matches our schema. */
-export function getJsonModeChatModel(modelName: string, temperature = 0.2): ChatOpenAI {
-  return new ChatOpenAI({
-    model: modelName,
-    apiKey: config.OPENROUTER_API_KEY,
-    configuration: { baseURL: config.OPENROUTER_BASE_URL, defaultHeaders: DEFAULT_HEADERS },
-    temperature,
-    modelKwargs: { response_format: { type: "json_object" } },
-    timeout: REQUEST_TIMEOUT_MS,
-  });
 }
 
 function isRetryableError(error: unknown): boolean {
@@ -65,11 +51,8 @@ function isRetryableError(error: unknown): boolean {
 }
 
 /** Transport-level retry: exponential backoff on network errors / 429s / provider 5xxs.
- * Separate from extraction.ts's schema-validation retry loop - this one retries the same
- * call because the request never reached (or never came back from) the model; that one
- * retries because the model answered but the answer didn't parse. This is the JS analog
- * of models.py's @retry(tenacity) decorator, written out explicitly instead of hidden
- * behind a decorator, since JS has no equivalent decorator-based retry in the stdlib. */
+ * Used by reviewAnalysisPipeline.ts so one flaky free-model response doesn't fail an
+ * entire 10-review batch. */
 export async function ainvokeWithRetry(chat: ChatOpenAI, messages: BaseMessage[]): Promise<AIMessage> {
   const maxAttempts = 3;
   let lastError: unknown;
@@ -101,14 +84,4 @@ export function extractTokenUsage(aiMessage: AIMessage): Record<string, unknown>
   }
   const metadataUsage = aiMessage.response_metadata?.tokenUsage ?? aiMessage.response_metadata?.token_usage;
   return (metadataUsage as Record<string, unknown> | undefined) ?? null;
-}
-
-export function estimateTokens(text: string): number {
-  return Math.max(1, Math.floor(text.length / 4));
-}
-
-export function estimateCostUsd(modelName: string, promptTokens: number, completionTokens: number): number {
-  const pricing = config.MODEL_PRICING_USD_PER_MILLION[modelName] ?? { input: 0, output: 0 };
-  const cost = (promptTokens / 1_000_000) * pricing.input + (completionTokens / 1_000_000) * pricing.output;
-  return Math.round(cost * 1_000_000) / 1_000_000;
 }

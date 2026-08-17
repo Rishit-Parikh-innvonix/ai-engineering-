@@ -1,101 +1,108 @@
 Week 2 (JS) - Mentor Prep
 ===========================
 
-Prep notes for talking through week2-js in a mentor session. Assumes you can
-already answer the week2 (Python) questions in week2/MENTOR_PREP.txt - this
-file focuses on the JS-specific follow-ups a mentor is likely to ask once
-they see both versions side by side.
+Prep notes for talking through week2-js in a mentor session: LangChain.js
+fundamentals - prompt templates, model invocation methods, and an LCEL
+structured-output pipeline.
 
-Q: Why build this in JS at all, if the Python version already works?
-A: To prove the concepts (SSE streaming, structured-output validation,
-   async concurrency) aren't tied to Python or FastAPI - they're general
-   backend/AI-engineering patterns. Rebuilding the same thing in a
-   different language forces you to separate "what LangChain/FastAPI did
-   for me" from "what I actually understand," because in JS none of it is
-   there to lean on by accident.
+Q: Why does ChatPromptTemplate matter over just building a prompt string?
+A: Reuse. `explainerPromptTemplate` (prompts.ts) is built once and formatted
+   with three different `{topic}/{audience}` pairs in promptTemplateDemo.ts -
+   the template itself never changes, only the variables passed to
+   `.formatMessages({...})`. `.partial({...})` goes further: it returns a new
+   template with some variables already filled in (style fixed, review left
+   open), which is useful when one part of a prompt is decided earlier in a
+   pipeline than another.
 
-Q: What's the single biggest structural difference between the two servers?
-A: FastAPI's StreamingResponse takes an async generator and handles writing
-   it to the socket and closing the connection for you. Express has no such
-   abstraction - app.ts calls res.write() manually for every SSE line and
-   res.end() manually when the stream is done or errors out. Same outcome,
-   one less layer of magic.
+Q: Does LangChain.js have invoke()/ainvoke() and stream()/astream() like
+   Python LangChain?
+A: No - only `.invoke()` and `.stream()`. Both already return a Promise (or
+   Promise of an async-iterable), because every LangChain.js call is
+   non-blocking by default; there's no separate "blocking" version to
+   distinguish from an async one. invocationMethodsDemo.ts demonstrates the
+   *behavior* Python's ainvoke()/astream() exist for - concurrent, in-flight-
+   at-once calls - using the same invoke()/stream() methods called via
+   `Promise.all` instead of awaited sequentially in a loop.
 
-Q: How does the JS server know when a client has disconnected mid-stream?
-A: res.on("close", ...) - registered once when the request comes in, it
-   fires when the underlying connection closes for any reason. app.ts
-   captures that into a `disconnected` boolean via closure and checks it on
-   every chunk inside the streaming loop, the same polling-per-chunk pattern
-   as the Python version's `await request.is_disconnected()`, just pushed via
-   an event instead of polled via a function call.
+Q: Why is the concurrent version faster?
+A: Each call is I/O-bound - almost all its time is spent waiting on
+   OpenRouter's network response. Sequential calls wait for each response
+   before starting the next, so total time is roughly the sum of every
+   latency. Concurrent calls (capped by a hand-written `Semaphore`, the JS
+   analog of `asyncio.Semaphore`) start the next request the instant the
+   previous one hands off to the network, so total time approaches the
+   slowest single request instead of the sum of all of them.
 
-Q: Where's the JSON-mode + validation logic, and how is it different from
-   using LangChain's built-in structured output helpers?
-A: extraction.ts, mirroring extraction.py exactly: call the model with
-   modelKwargs: { response_format: { type: "json_object" } } (JSON-mode -
-   guarantees valid JSON syntax, not valid shape), then JSON.parse the text
-   and run it through SupportTicketSchema.parse() (zod - guarantees the
-   *shape*: right fields, right types, priority/issue_type inside the
-   allowed enum). This project deliberately does NOT use LangChain.js's
-   `.withStructuredOutput(schema)` helper, which uses a different mechanism
-   (tool/function calling) under the hood - the point here was to replicate
-   the Python version's specific two-layer JSON-mode-then-validate approach
-   step for step, not to find the shortest path to structured output.
+Q: What's a RunnableSequence, concretely?
+A: A list of Runnables (anything with a uniform `.invoke(input)` interface)
+   chained so each step's output feeds the next step's input.
+   reviewAnalysisPipeline.ts builds two:
+     RunnableSequence.from([prompt, model.withStructuredOutput(schema)])
+     RunnableSequence.from([promptWithFormatInstructions, model, parser])
+   Same shape as Python LCEL's `prompt | model | parser` - LangChain.js just
+   spells composition as `RunnableSequence.from([...])` instead of
+   overloading the `|` operator.
 
-Q: What happens on a malformed response?
-A: Same reject-and-retry loop as Python: JSON.parse throwing a SyntaxError,
-   or SupportTicketSchema.parse throwing a ZodError, both get caught and
-   treated as "malformed, retry" (up to EXTRACTION_MAX_RETRIES = 3, same as
-   Python). Any other kind of error (e.g. a real network failure) is logged
-   and retried too, but categorized separately in the log line so you can
-   tell "the model answered but the answer was garbage" apart from "the
-   request itself failed."
+Q: Why build two different structured-output implementations instead of
+   picking one?
+A: The assignment asks to compare them. `withStructuredOutput(schema)` lets
+   LangChain generate format instructions and handle parsing/validation
+   internally (usually via tool-calling) - less code, less visibility.
+   `StructuredOutputParser.fromZodSchema(schema)` requires injecting
+   `parser.getFormatInstructions()` into the prompt yourself and running the
+   raw text reply through the parser afterward - more code, but every step
+   is visible and independently swappable. Both run over the same 10 reviews
+   so their success rate and timing can be compared side by side rather than
+   assumed equivalent.
 
-Q: Why is there a hand-written retry loop instead of a library like tenacity?
-A: There's no equivalent decorator-based retry library in common JS use for
-   this pattern, so models.ts's ainvokeWithRetry writes the exponential
-   backoff out explicitly: on a retryable error (network error, or HTTP 429
-   / 5xx), wait min(8000ms, 1000ms * 2^(attempt-1)) and try again, up to 3
-   attempts, then rethrow. This is deliberately the same backoff formula
-   tenacity's wait_exponential(multiplier=1, min=1, max=8) uses - just
-   visible in the code instead of hidden in a decorator.
+Q: Where does the zod schema come in?
+A: `ReviewAnalysisSchema` (schemas.ts) is a runtime validator - `.parse()`
+   throws a ZodError on a shape mismatch - and, via `z.infer<typeof
+   ReviewAnalysisSchema>`, a compile-time TypeScript type in the same
+   definition. Both pipeline implementations validate the model's reply
+   against this one schema, so a shape mismatch (wrong enum value, missing
+   field) surfaces the same way regardless of which implementation produced
+   it.
 
-Q: How is bounded concurrency implemented without asyncio.Semaphore?
-A: syncVsAsync.ts defines a small Semaphore class by hand: a counter of
-   available "slots" and a queue of pending resolvers. acquire() either
-   takes a free slot immediately or waits on a Promise that release()
-   resolves later. It's ~15 lines and reproduces exactly what
-   asyncio.Semaphore(3) does in the Python version - cap concurrent
-   OpenRouter requests at 3 so the free-tier 20-req/minute limit isn't hit.
+Q: What happens when a review fails to produce valid structured output?
+A: `runPipeline()` in reviewAnalysisPipeline.ts catches the error per-review
+   and records `{review, analysis: null, error: "..."}` instead of retrying
+   or crashing the batch. This is deliberate: the exercise is about
+   comparing the two implementations' success rates, so a schema failure is
+   a data point to report, not something to hide behind a retry loop.
 
-Q: What were the actual measured results, and do they match the Python run?
-A: Same shape, not identical numbers (different runs, different network
-   conditions, and Node/Python have different startup overhead): JS sync
-   took 15.71s / async took 2.11s for the same 6 prompts at concurrency 3 -
-   a 7.45x speedup. Peak memory stayed flat (82.1MB vs 84.7MB) between
-   modes in both languages, for the same underlying reason: this workload
-   is I/O-bound, not memory-bound, so concurrency buys wall-clock time, not
-   reduced memory use.
+Q: Where does `ainvokeWithRetry` fit in, then?
+A: It's transport-level only - exponential backoff on network errors / 429s
+   / 5xxs from OpenRouter, so one flaky free-model response doesn't kill an
+   otherwise-successful 10-review run. It's separate from schema-validation
+   failures, which are the thing being measured, not retried away.
 
-Q: If you had to productionize this, what would you change first?
-A: Same three things as the Python version's mentor prep, plus one
-   JS-specific item: swap the hand-written getFormatInstructions() /
-   JSON.parse / zod.parse chain for LangChain.js's
-   `.withStructuredOutput(schema)` (tool-calling-based structured output),
-   which is more reliable across models that don't strictly honor
-   response_format: json_object. This project used the manual version on
-   purpose, to make every validation step visible for learning - a real
-   service would prefer the built-in helper.
+Q: Why OpenRouter instead of separate Groq/Mistral/Gemini SDKs, given the
+   assignment names all three?
+A: Model choice, not provider-SDK choice, is what the exercises actually
+   exercise (prompt templates, invocation methods, structured output). Using
+   OpenRouter with one API key and picking a Gemini model, a Mistral model,
+   and a Llama model (the family Groq is best known for serving) through it
+   keeps the "compare providers" spirit of the assignment while avoiding
+   three separate API keys/SDKs for what's fundamentally a LangChain.js
+   exercise, not a provider-integration exercise.
+
+Q: Bonus - what's still unchanged from before?
+A: toolCallingDemo.ts (the bind_tools-equivalent function-calling demo) is
+   untouched - same two lookup tools, same 3 scenarios, same 4-round tool-
+   call loop. It wasn't part of the graded exercises being rebuilt here.
 
 Gotchas worth mentioning if asked
 ------------------------------------
-- Both the Python and JS servers default to port 8000 - they can't run at
-  the same time on the default port. Set PORT=8010 (or similar) via env var
-  to run the JS one alongside the Python one, as done for testing here.
 - `chat.stream(messages)` in LangChain.js returns a Promise you must await
   before you can `for await` over it - `for await (const c of chat.stream(m))`
   without the inner `await` is a TypeScript compile error, not a silent bug.
-- Node buffers stdout when it's redirected to a file/pipe (not a TTY) more
-  aggressively than when attached to an interactive terminal - console.log
-  lines can lag behind real request handling if you're tailing a redirected
-  log file, even though the actual HTTP responses are already correct.
+- The timing numbers printed by invocationMethodsDemo.ts and
+  reviewAnalysisPipeline.ts are measured live against whatever free-tier
+  model load/rate limits exist at run time - there's no single "verified"
+  number to quote, unlike a fixed benchmark; re-run them to get current
+  numbers before a mentor session.
+- Free OpenRouter models occasionally return a malformed or empty reply -
+  that's genuine API flakiness, not a bug in the chain logic, which is why
+  reviewAnalysisPipeline.ts reports per-review failures instead of treating
+  the whole run as broken.

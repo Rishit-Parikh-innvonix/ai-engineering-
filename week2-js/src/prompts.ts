@@ -1,23 +1,41 @@
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 
-// Exercise 1: system message sets behavior once; {question} is the human message.
-export const STREAM_SYSTEM_PROMPT =
-  "You are a concise, helpful assistant answering a user's question in a live chat interface. " +
-  "Keep answers clear, accurate, and to the point.";
-
-export const streamPromptTemplate = ChatPromptTemplate.fromMessages([
-  ["system", STREAM_SYSTEM_PROMPT],
-  ["human", "{question}"],
+// Exercise 1: Prompt Templates
+// ---------------------------------------------------------------------------
+// One reusable template, invoked with different {topic}/{audience} values -
+// the point of ChatPromptTemplate is that the template is built once and
+// formatted many times, rather than re-writing the prompt string per call.
+export const explainerPromptTemplate = ChatPromptTemplate.fromMessages([
+  ["system", "You are a patient teacher who explains technical topics to a specific audience. Keep it to 3 sentences."],
+  ["human", "Explain {topic} to a {audience}."],
 ]);
 
-// Exercise 2: system message constrains the model to the schema and to only using
-// facts present in the email; {format_instructions} is injected by extraction.ts.
-export const EXTRACTION_SYSTEM_PROMPT =
-  "You are a backend service that extracts structured ticket data from raw customer support " +
-  "emails. You only use information that is actually present in the email. You never invent an " +
-  "email address, name, or fact that isn't stated. Respond with a single JSON object and nothing else.";
+// A second reusable template, built with .partial() so the "style" instruction
+// is fixed once and only {review} varies per call - demonstrates that
+// ChatPromptTemplate supports partial application, not just plain formatting.
+export const reviewRewritePromptTemplateBase = ChatPromptTemplate.fromMessages([
+  ["system", "Rewrite the customer review the user gives you in a {style} tone. Keep it to 2 sentences."],
+  ["human", "{review}"],
+]);
 
-export const extractionPromptTemplate = ChatPromptTemplate.fromMessages([
-  ["system", EXTRACTION_SYSTEM_PROMPT],
-  ["human", '{format_instructions}\n\nCustomer support email:\n"""\n{email_text}\n"""'],
+// Exercise 3: Review Analysis Pipeline
+// ---------------------------------------------------------------------------
+// Used by the .withStructuredOutput() implementation - no format instructions
+// needed since the schema is bound directly to the model call.
+export const reviewAnalysisPromptTemplate = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    "You are an assistant that analyzes customer product reviews. Base your answer only on what the review actually says.",
+  ],
+  ["human", "Analyze this review:\n\n\"\"\"\n{review}\n\"\"\""],
+]);
+
+// Used by the StructuredOutputParser implementation - {format_instructions} is
+// injected by reviewAnalysisPipeline.ts from the parser itself.
+export const reviewAnalysisWithFormatInstructionsPromptTemplate = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    "You are an assistant that analyzes customer product reviews. Base your answer only on what the review actually says.\n\n{format_instructions}",
+  ],
+  ["human", "Analyze this review:\n\n\"\"\"\n{review}\n\"\"\""],
 ]);
