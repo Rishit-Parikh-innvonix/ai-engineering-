@@ -11,6 +11,7 @@ import * as models from "./models.js";
 import { ReviewAnalysisSchema } from "./schemas.js";
 import { reviewAnalysisPromptTemplate, reviewAnalysisWithFormatInstructionsPromptTemplate } from "./prompts.js";
 import { StructuredOutputParser } from "@langchain/core/output_parsers";
+import { RunnableSequence } from "@langchain/core/runnables";
 
 const REVIEW =
   "Mixed feelings here. The app's interface is beautiful and intuitive, but it crashes at least " +
@@ -26,7 +27,7 @@ async function demoStructuredOutputStream(): Promise<void> {
 
   const chat = models.getChatModel(config.REVIEW_MODEL, { temperature: 0.2, streaming: true });
   const structuredChat = chat.withStructuredOutput(ReviewAnalysisSchema);
-  const chain = reviewAnalysisPromptTemplate.pipe(structuredChat);
+  const chain = RunnableSequence.from([reviewAnalysisPromptTemplate, structuredChat]);
 
   const stream = await chain.stream({ review: REVIEW });
   let finalChunk: unknown;
