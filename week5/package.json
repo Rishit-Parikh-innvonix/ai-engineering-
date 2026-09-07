@@ -1,0 +1,28 @@
+{
+  "name": "week5",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Week 5 - Agents: pre-built LangChain tools, a custom tool, tool calling, and a ReAct agent.",
+  "scripts": {
+    "exercise1": "tsx src/exercise1PrebuiltTool.ts",
+    "exercise2": "tsx src/exercise2CustomTool.ts",
+    "exercise3": "tsx src/exercise3ReactAgent.ts",
+    "agents-demo": "tsx src/runAll.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@langchain/community": "^1.1.29",
+    "@langchain/core": "^1.2.8",
+    "@langchain/openai": "^1.5.8",
+    "chalk": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "langchain": "^1.5.10",
+    "math-expression-evaluator": "^2.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
