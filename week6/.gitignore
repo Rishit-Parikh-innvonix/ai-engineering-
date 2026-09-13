@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+
+# The filesystem MCP server can write into sandbox/ while the demo runs (write_file, edit_file) -
+# ignore anything it creates, but todo.txt is a committed fixture exercise 3 reads, not scratch
+# output, so it must stay tracked.
+sandbox/*
+!sandbox/todo.txt
+
+# The memory MCP server's persistent knowledge graph (see src/mcpDemo.ts - MEMORY_FILE) - real
+# runtime data the demo generates, not something to commit.
+mcp-memory/
