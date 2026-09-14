@@ -28,5 +28,11 @@ export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 // week5's free-tier model (minimax/minimax-m2.7:free) was pulled from OpenRouter's free tier
 // between week5 and week6 (confirmed live: OpenRouter now 404s it, pointing at a paid slug
 // instead) - checked OpenRouter's /api/v1/models for currently free models whose
-// supported_parameters list both "tools" and "tool_choice" and picked this one.
-export const CLOUD_MODEL = "nex-agi/nex-n2.5-pro:free";
+// supported_parameters list both "tools" and "tool_choice".
+//
+// Initially picked nex-agi/nex-n2.5-pro:free, but it hung completely (no response at all,
+// confirmed by testing it directly with zero MCP involved) on two separate live runs. Probed 3
+// tool-calling-capable free models across several repeated runs each: nex-n2.5-mini:free was the
+// fastest (0.6-1.2s) and never failed once, while nex-n2.5-pro:free ranged 1.7-5.2s and had
+// already hung outright twice. Switched to the smaller, more consistently available model.
+export const CLOUD_MODEL = "nex-agi/nex-n2.5-mini:free";

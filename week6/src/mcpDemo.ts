@@ -31,6 +31,14 @@ import { printPanel, printSectionHeader } from "./utils.js";
 const SANDBOX_DIR = path.join(PROJECT_ROOT, "sandbox");
 const TODO_FILE = path.join(SANDBOX_DIR, "todo.txt");
 
+// A real, live incident: an earlier test run of this exact script was left running in the
+// background and never shut down, which kept mcp-memory/memory.jsonl locked - the NEXT run then
+// froze forever on its first memory tool call, with zero explanation, waiting on a lock that
+// was never going to clear. Without a limit, "the assistant is thinking" and "something is stuck
+// forever" look identical from the terminal. This bounds every assistant call so a stuck run
+// fails loudly with a clear message instead of hanging silently.
+const ASSISTANT_TIMEOUT_MS = 60_000;
+
 // The memory helper saves what it remembers into this file, so it survives between separate
 // runs of this script - just like your phone remembers your contacts even after you restart it.
 // By default this helper tries to save inside its own node_modules folder instead (checked this
@@ -99,7 +107,7 @@ async function exercise2AssistantRemembersYou(): Promise<void> {
     "engineering. Then tell me what you now remember about me.";
   console.log(`You say: ${question}`);
 
-  const result = await assistant.invoke({ messages: [new HumanMessage(question)] });
+  const result = await assistant.invoke({ messages: [new HumanMessage(question)] }, { timeout: ASSISTANT_TIMEOUT_MS });
   logToolCalls(result.messages);
   const finalMessage = result.messages[result.messages.length - 1];
   console.log(`\nAssistant replies:\n${finalMessage.content}`);
@@ -122,7 +130,7 @@ async function exercise3AssistantChecksYourTodoListAndRemembers(): Promise<void>
     "me both what my priority task is and what else you remember about me.";
   console.log(`You say: ${question}`);
 
-  const result = await assistant.invoke({ messages: [new HumanMessage(question)] });
+  const result = await assistant.invoke({ messages: [new HumanMessage(question)] }, { timeout: ASSISTANT_TIMEOUT_MS });
   logToolCalls(result.messages);
   const finalMessage = result.messages[result.messages.length - 1];
   console.log(`\nAssistant replies:\n${finalMessage.content}`);
@@ -138,6 +146,26 @@ async function main(): Promise<void> {
     await exercise1SeeWhatTheAssistantCanDo();
     await exercise2AssistantRemembersYou();
     await exercise3AssistantChecksYourTodoListAndRemembers();
+  } catch (error) {
+    // Confirmed live, twice: a "stuck" run has two real, different causes, not one -
+    // don't guess which one it is, tell the user how to check both.
+    console.error(`\nSomething went wrong: ${error instanceof Error ? error.message : error}`);
+    console.error(
+      "\nThis is most likely one of two things:\n" +
+        "1. The free OpenRouter model itself is slow or temporarily overloaded right now (this " +
+        "is\n" +
+        "   an OpenRouter/model issue, not a bug here - confirmed by testing the model directly " +
+        "with\n" +
+        "   no MCP involved at all and seeing the exact same hang). Just try again in a bit.\n" +
+        "2. A leftover copy of this demo from an earlier attempt is still running and holding\n" +
+        "   mcp-memory/memory.jsonl locked. Check for it:\n" +
+        "     Windows (PowerShell): Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+        "Select-Object ProcessId, CommandLine\n" +
+        "     macOS/Linux:           ps aux | grep mcp-server\n" +
+        "   ...and close any match before trying again."
+    );
+    process.exitCode = 1;
+    return;
   } finally {
     // Both helpers are real separate programs still running in the background - this shuts
     // them down so your terminal actually returns control to you instead of hanging forever.
