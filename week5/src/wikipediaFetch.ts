@@ -12,7 +12,7 @@
  */
 
 const WIKIPEDIA_HOSTNAME = "en.wikipedia.org";
-const USER_AGENT = "week5-agents-demo/1.0 (educational project; contact: parikhrishit@gmail.com)";
+const USER_AGENT = "week5-agents-demo/1.0 (educational project)";
 
 let installed = false;
 
