@@ -1,0 +1,26 @@
+{
+  "name": "week7",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Week 7 - LangGraph: a research assistant built from planning, retrieval, summarization and answer agents.",
+  "scripts": {
+    "research": "tsx src/research.ts",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.2.8",
+    "@langchain/langgraph": "^1.4.14",
+    "@langchain/openai": "^1.5.8",
+    "chalk": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "fast-xml-parser": "^5.11.1",
+    "zod": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
