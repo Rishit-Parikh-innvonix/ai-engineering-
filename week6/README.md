@@ -97,10 +97,21 @@ it any time you want the assistant to forget everything and start fresh.)
 `week5` used `minimax/minimax-m2.7:free` on OpenRouter. Between `week5` and
 this week, OpenRouter pulled that model's free tier (confirmed live - it now
 404s, pointing at a paid version instead). Checked OpenRouter's live model
-list for a currently-free model that actually supports tool calling and
-switched to `nex-agi/nex-n2.5-pro:free` - verified against all 3 exercises.
-If this model also stops being free at some point, `src/config.ts`'s
-`CLOUD_MODEL` is the only place that needs to change.
+list for a currently-free model that actually supports tool calling; went
+through `nex-agi/nex-n2.5-pro:free` and then `nex-n2.5-mini:free` (both
+eventually hung outright), then `nvidia/nemotron-3-super-120b-a12b:free`
+(started strong, then within the same session began failing ~60% of calls
+with the provider's "Service temporarily overloaded" error) - all confirmed
+via direct calls with zero MCP involved, so this is upstream free-tier
+reliability, not a bug here. `models.ts` also has an `invokeWithRetry()`
+wrapper around both agent calls specifically to survive occasional
+transient failures like this, but a ~60% failure rate isn't something a
+3-attempt retry reliably beats.
+Currently on `cohere/north-mini-code:free`, verified against all 3
+exercises with zero retries needed. If this model also stops being free or
+reliable at some point, `src/config.ts`'s `CLOUD_MODEL` is the only place
+that needs to change - and
+its comment there documents the full history of what was tried before it.
 
 ## Project layout
 

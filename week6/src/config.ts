@@ -31,8 +31,15 @@ export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 // supported_parameters list both "tools" and "tool_choice".
 //
 // Initially picked nex-agi/nex-n2.5-pro:free, but it hung completely (no response at all,
-// confirmed by testing it directly with zero MCP involved) on two separate live runs. Probed 3
-// tool-calling-capable free models across several repeated runs each: nex-n2.5-mini:free was the
-// fastest (0.6-1.2s) and never failed once, while nex-n2.5-pro:free ranged 1.7-5.2s and had
-// already hung outright twice. Switched to the smaller, more consistently available model.
-export const CLOUD_MODEL = "nex-agi/nex-n2.5-mini:free";
+// confirmed by testing it directly with zero MCP involved) on two separate live runs, so
+// switched to nex-n2.5-mini:free. That one later started hanging too (2026-09-15: confirmed
+// via a direct curl call, zero MCP involved, full 35s timeout with no response at all -
+// upstream model reliability, not this project). Switched to nvidia/nemotron-3-super-120b-a12b:free
+// next - looked solid initially (4/4 direct calls), but within the same session started
+// failing ~60% of calls (3/5 direct test calls) with OpenRouter's Nvidia provider returning
+// "Service temporarily overloaded" (502) wrapped inside a 200 OK body with zero choices -
+// invokeWithRetry() in models.ts exists specifically to survive that failure mode, but a 60%
+// failure rate beats even a 3-attempt retry too often to be worth keeping as the default.
+// Re-probed and switched to cohere/north-mini-code:free - 5/5 direct calls succeeded, and it
+// completed all 3 exercises live with zero retries needed on either agent call.
+export const CLOUD_MODEL = "cohere/north-mini-code:free";

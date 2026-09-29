@@ -25,7 +25,7 @@ import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 import { createAgent } from "langchain";
 
 import { PROJECT_ROOT } from "./config.js";
-import { getCloudChatModel } from "./models.js";
+import { getCloudChatModel, invokeWithRetry } from "./models.js";
 import { printPanel, printSectionHeader } from "./utils.js";
 
 const SANDBOX_DIR = path.join(PROJECT_ROOT, "sandbox");
@@ -107,7 +107,10 @@ async function exercise2AssistantRemembersYou(): Promise<void> {
     "engineering. Then tell me what you now remember about me.";
   console.log(`You say: ${question}`);
 
-  const result = await assistant.invoke({ messages: [new HumanMessage(question)] }, { timeout: ASSISTANT_TIMEOUT_MS });
+  const result = await invokeWithRetry(
+    () => assistant.invoke({ messages: [new HumanMessage(question)] }, { timeout: ASSISTANT_TIMEOUT_MS }),
+    "exercise 2 assistant call"
+  );
   logToolCalls(result.messages);
   const finalMessage = result.messages[result.messages.length - 1];
   console.log(`\nAssistant replies:\n${finalMessage.content}`);
@@ -130,7 +133,10 @@ async function exercise3AssistantChecksYourTodoListAndRemembers(): Promise<void>
     "me both what my priority task is and what else you remember about me.";
   console.log(`You say: ${question}`);
 
-  const result = await assistant.invoke({ messages: [new HumanMessage(question)] }, { timeout: ASSISTANT_TIMEOUT_MS });
+  const result = await invokeWithRetry(
+    () => assistant.invoke({ messages: [new HumanMessage(question)] }, { timeout: ASSISTANT_TIMEOUT_MS }),
+    "exercise 3 assistant call"
+  );
   logToolCalls(result.messages);
   const finalMessage = result.messages[result.messages.length - 1];
   console.log(`\nAssistant replies:\n${finalMessage.content}`);
@@ -147,16 +153,16 @@ async function main(): Promise<void> {
     await exercise2AssistantRemembersYou();
     await exercise3AssistantChecksYourTodoListAndRemembers();
   } catch (error) {
-    // Confirmed live, twice: a "stuck" run has two real, different causes, not one -
-    // don't guess which one it is, tell the user how to check both.
-    console.error(`\nSomething went wrong: ${error instanceof Error ? error.message : error}`);
+    // Confirmed live: assistant calls already retry a few times on their own (see
+    // invokeWithRetry in models.ts) for the free model's transient "200 OK but empty
+    // response" flakiness - reaching this catch means either that flakiness outlasted
+    // every retry, or one of these two other causes.
+    console.error(`\nSomething went wrong even after retrying: ${error instanceof Error ? error.message : error}`);
     console.error(
-      "\nThis is most likely one of two things:\n" +
-        "1. The free OpenRouter model itself is slow or temporarily overloaded right now (this " +
-        "is\n" +
-        "   an OpenRouter/model issue, not a bug here - confirmed by testing the model directly " +
-        "with\n" +
-        "   no MCP involved at all and seeing the exact same hang). Just try again in a bit.\n" +
+      "\nThis is most likely one of these:\n" +
+        "1. The free OpenRouter model is having a genuinely bad stretch right now (this is an\n" +
+        "   OpenRouter/model issue, not a bug here - confirmed by testing the model directly with\n" +
+        "   no MCP involved at all and seeing the exact same failure). Just try again in a bit.\n" +
         "2. A leftover copy of this demo from an earlier attempt is still running and holding\n" +
         "   mcp-memory/memory.jsonl locked. Check for it:\n" +
         "     Windows (PowerShell): Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
