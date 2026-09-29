@@ -1,0 +1,7 @@
+langgraph>=1.2,<2
+langchain-openai>=1.6,<2
+langchain-core>=1.6,<2
+pydantic>=2.13,<3
+httpx>=0.28,<1
+python-dotenv>=1.2,<2
+pytest>=9,<10
