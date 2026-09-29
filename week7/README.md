@@ -1,8 +1,10 @@
 # Week 7 - LangGraph: a Research Brief Builder
 
-Give it a topic. Four AI agents (planning, retrieval, summarization, final answer),
+Give it a topic. Five AI agents (routing, planning, retrieval, summarization, final answer),
 coordinated by a LangGraph workflow, research it across Wikipedia, arXiv and Hacker News
 and save a **markdown brief with numbered citations and real links** under `reports/`.
+Questions that need **live data** ("current weather in Ahmedabad") are routed to a tool instead
+of the search sources, which cannot answer them.
 
 ```
 cd week7
@@ -29,6 +31,12 @@ and LangGraph decides who goes next.
 topic
   |
   v
+ROUTER (AI) ------------ RESEARCH | WEATHER: <city> | MIXED: <city> | <rest> | UNSUPPORTED_LIVE
+  |  weather -> WEATHER TOOL (code: Open-Meteo, no key) -> summarizer   (no searching)
+  |  mixed   -> WEATHER TOOL -> planner (only the non-weather part), one library for both
+  |  unsupported -> honest "needs live data, no tool for it" report -> save
+  |  research (and any failure of the router or the tool) -> below
+  v
 PLANNER (AI) ---------> 3 sub-questions
   |
   v   one parallel branch per sub-question
@@ -53,9 +61,9 @@ SAVE (code) -----------> reports/<topic>-<timestamp>.md
 | LangGraph concept | Where it is |
 |---|---|
 | **State** | `src/state.ts` - the shared notebook |
-| **Nodes** | `src/graph.ts` - plan, retrieve, coverage, summarize, write, checkCitations, save |
+| **Nodes** | `src/graph.ts` - router, weatherTool, unsupported, plan, retrieve, coverage, summarize, write, checkCitations, save |
 | **Edges** | `src/graph.ts` - the fixed arrows (`addEdge`) |
-| **Conditional routing** | `src/graph.ts` - `afterCoverage`, `afterSummarize`, `afterCitationCheck` |
+| **Conditional routing** | `src/graph.ts` - `afterRoute`, `afterWeather`, `afterCoverage`, `afterSummarize`, `afterCitationCheck` |
 | **Parallel execution** | `src/graph.ts` - `fanOutRetrieval` returns one `Send` per sub-question |
 | **Reducer** | `src/state.ts` - `appended()` merges what parallel branches write |
 
@@ -63,7 +71,7 @@ SAVE (code) -----------> reports/<topic>-<timestamp>.md
 
 | AI (can be wrong) | Plain code (predictable, tested) |
 |---|---|
-| planner, query writer, relevance judge, summarizer, answer writer | the three web searches, coverage check, citation check, source numbering, report building, retries |
+| router, planner, query writer, relevance judge, summarizer, answer writer | the weather tool (every number in the reading is copied from the API, never written by the AI), the three web searches, coverage check, citation check, source numbering, report building, retries |
 
 ## What the safeguards do - and don't - guarantee
 
@@ -74,6 +82,14 @@ SAVE (code) -----------> reports/<topic>-<timestamp>.md
   source 3 actually says what the sentence says. The writer is told to use only its notes, but
   treat the brief as a well-sourced starting point and click through the sources for anything
   important. Hacker News results are developers' opinions, not facts.
+- **The AI chooses the route, code checks it.** The router answers in one strictly parsed line
+  (`parseRouteReply`); a reply that can't be parsed is asked again, and if the router or the
+  weather tool still fails the run falls back to plain research and *About this run* says so.
+  Measured on the live model: 10/10 on a sample of weather, research, mixed and other-live-data
+  topics. The city is resolved by Open-Meteo's geocoder (top match, or the one matching a
+  "City, Country" qualifier - there is an Ahmedabad in Pakistan too) and the resolved place is
+  printed in the brief, so a wrong match is visible. A weather reading is a snapshot, so the
+  brief header carries the time (UTC) and the reading carries the local observation time.
 - **Nothing is invented when nothing is found.** If a sub-question has no relevant source, the
   brief's *Limitations* section says so (seen live), and if nothing is found at all the report
   says that instead of asking the AI to write anyway.
@@ -102,7 +118,7 @@ SAVE (code) -----------> reports/<topic>-<timestamp>.md
 ## Tests
 
 ```
-npm test          # 37 tests, no network and no API key needed
+npm test          # 48 tests, no network and no API key needed
 npm run typecheck
 ```
 
@@ -122,10 +138,11 @@ week7/
   src/
     research.ts              the command you run
     graph.ts                 the flowchart: nodes, edges, routers
+    tools/weather.ts         the live-data tool (Open-Meteo geocoding + current conditions)
     state.ts                 the shared notebook
     logic.ts                 pure decisions: numbering, coverage, citation check, report
     types.ts                 shared data shapes (zod)
-    agents/                  planner.ts, retrieval.ts (queries + relevance judge),
+    agents/                  router.ts, planner.ts, retrieval.ts (queries + relevance judge),
                              summarizer.ts, writer.ts, llm.ts (retries), types.ts
     sources/                 wikipedia.ts, arxiv.ts, hackernews.ts, http.ts, text.ts
     config.ts, models.ts, report.ts, utils.ts

@@ -5,8 +5,8 @@
  */
 
 import { truncate } from "./sources/text.js";
-import type { SourceKind } from "./sources/types.js";
-import type { NumberedSource, QueryPlan, RetrievedBatch } from "./types.js";
+import type { SourceDocument, SourceKind } from "./sources/types.js";
+import type { NumberedSource, QueryPlan, RetrievedBatch, RouteDecision } from "./types.js";
 
 export const LIMITS = {
   // A sub-question counts as covered once ONE relevant source turned up. Sources are already
@@ -19,22 +19,30 @@ export const LIMITS = {
   maxDrafts: 3,
 } as const;
 
-const KIND_ORDER: Record<SourceKind, number> = { wikipedia: 0, arxiv: 1, hackernews: 2 };
+const KIND_ORDER: Record<SourceKind, number> = { weather: 0, wikipedia: 1, arxiv: 2, hackernews: 3 };
 export const KIND_LABEL: Record<SourceKind, string> = {
   wikipedia: "Wikipedia",
   arxiv: "arXiv",
   hackernews: "Hacker News",
+  weather: "Open-Meteo weather",
 };
 
 /**
  * Flattens every batch into one numbered list. Parallel branches finish in whatever order the
  * network allows, so the order is fixed by content (sub-question, then source type, then rank)
  * instead of arrival time - the same run always produces the same [1], [2], [3] numbering.
+ * Live-tool readings (weather) come first and belong to no sub-question (index -1).
  */
-export function buildLibrary(batches: RetrievedBatch[]): NumberedSource[] {
-  const candidates = batches.flatMap((batch) =>
-    batch.documents.map((document, position) => ({ document, batch, position }))
-  );
+export function buildLibrary(batches: RetrievedBatch[], toolDocuments: SourceDocument[] = []): NumberedSource[] {
+  const toolCandidates = toolDocuments.map((document, position) => ({
+    document,
+    batch: { subQuestionIndex: -1, attempt: 0 },
+    position,
+  }));
+  const candidates = [
+    ...toolCandidates,
+    ...batches.flatMap((batch) => batch.documents.map((document, position) => ({ document, batch, position }))),
+  ];
   candidates.sort(
     (a, b) =>
       a.batch.subQuestionIndex - b.batch.subQuestionIndex ||
@@ -73,6 +81,32 @@ export function findUncoveredSubQuestions(subQuestionCount: number, batches: Ret
 // The queries already tried for a sub-question, so a retry can be told to word things differently.
 export function previousQueriesFor(batches: RetrievedBatch[], subQuestionIndex: number): QueryPlan[] {
   return batches.filter((batch) => batch.subQuestionIndex === subQuestionIndex).map((batch) => batch.queries);
+}
+
+/**
+ * Parses the router's reply, which must be one of:
+ *   RESEARCH | UNSUPPORTED_LIVE | WEATHER: <city> | MIXED: <city> | <the rest of the question>
+ * Anything else throws, so the caller asks again instead of guessing what a rambling answer meant.
+ * The city is validated here (real letters, sane length); whether it actually exists is the
+ * weather tool's job.
+ */
+export function parseRouteReply(reply: string): RouteDecision {
+  const cleaned = reply.trim().replace(/^["'`]+|["'`.]+$/g, "");
+  if (/^research$/i.test(cleaned)) return { kind: "research" };
+  if (/^unsupported_live$/i.test(cleaned)) return { kind: "unsupported" };
+
+  const match = cleaned.match(/^(weather|mixed)\s*:\s*([^|]+?)\s*(?:\|\s*(.*))?$/i);
+  if (!match) throw new Error(`Unexpected router reply: "${cleaned.slice(0, 60)}"`);
+
+  const city = match[2].trim();
+  if (city.length < 2 || city.length > 80 || !/\p{L}{2}/u.test(city)) {
+    throw new Error(`The router gave an unusable city: "${city.slice(0, 40)}"`);
+  }
+  if (match[1].toLowerCase() === "weather") return { kind: "weather", city };
+
+  const researchTopic = (match[3] ?? "").trim();
+  if (researchTopic.length < 3) throw new Error("The router chose MIXED but gave no research question after the city.");
+  return { kind: "mixed", city, researchTopic };
 }
 
 // Accepts [1], [1][2] and also [1, 2], since models write all three.
@@ -203,7 +237,7 @@ export function buildReport(input: {
   body: string;
   library: NumberedSource[];
   runNotes: string[];
-  generatedOn: string;
+  generatedOn: string; // date, optionally with a time - live data is a snapshot, so the time matters
 }): string {
   const { body, sources } = keepCitedSources(input.body, input.library);
   const runNotes = [...input.runNotes];

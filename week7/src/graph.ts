@@ -1,7 +1,13 @@
 /**
  * The flowchart. Everything about HOW the agents are coordinated lives here:
  *
- *   START -> plan -> retrieve (one parallel branch per sub-question; each writes queries,
+ *   START -> router -> research:    plan (below)
+ *                  -> weather:     weatherTool -> summarize (below)      live data: no searching
+ *                  -> mixed:       weatherTool -> plan (below)           both, in one library
+ *                  -> unsupported: save                                  needs live data we lack
+ *            (the weather tool failing falls back to plan; the router failing means "research")
+ *
+ *   plan -> retrieve (one parallel branch per sub-question; each writes queries,
  *                     searches 3 sources at once, and drops off-topic results) -> coverage
  *                                 ^                                                 |
  *                                 '---- nothing relevant for some question? retry (max 2) ---'
@@ -18,6 +24,7 @@
 import { END, Send, START, StateGraph } from "@langchain/langgraph";
 
 import type { Agents } from "./agents/types.js";
+import type { WeatherTool } from "./tools/weather.js";
 import {
   buildExtractiveDraft,
   buildLibrary,
@@ -35,6 +42,7 @@ import { logStep, since } from "./utils.js";
 export interface GraphDependencies {
   agents: Agents;
   fetchers: SourceFetcher[];
+  weather: WeatherTool;
   saveReport(topic: string, markdown: string): Promise<string>;
 }
 
@@ -49,12 +57,72 @@ interface RetrievalTask {
 
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-export function createResearchGraph({ agents, fetchers, saveReport }: GraphDependencies) {
+export function createResearchGraph({ agents, fetchers, weather, saveReport }: GraphDependencies) {
   // ---- Agent nodes: each one reads the notebook and returns only what it changed ----
+
+  // The first diamond: research, a live-data tool, both, or neither. If the routing call itself
+  // fails, plain research is the safe default - it is what the workflow did before it had tools.
+  const route = async (state: typeof ResearchState.State) => {
+    const startedAt = Date.now();
+    try {
+      const decision = await agents.route(state.topic);
+      logStep(
+        "Router",
+        `${decision.kind}${"city" in decision ? ` (${decision.city})` : ""} (${since(startedAt)})`
+      );
+      return {
+        route: decision.kind,
+        weatherCity: "city" in decision ? decision.city : "",
+        researchTopic: decision.kind === "mixed" ? decision.researchTopic : "",
+      };
+    } catch (error) {
+      logStep("Router", `failed (${errorMessage(error)}) - treating the topic as plain research`);
+      return {
+        route: "research" as const,
+        runNotes: [`The routing agent failed (${errorMessage(error)}), so the topic was researched without live-data tools.`],
+      };
+    }
+  };
+
+  // Plain code calling the weather API. On failure the run degrades to research, and says so.
+  const weatherTool = async (state: typeof ResearchState.State) => {
+    const startedAt = Date.now();
+    try {
+      const document = await weather.lookup(state.weatherCity);
+      logStep("Weather tool", `${document.title} (${since(startedAt)})`);
+      return {
+        toolDocs: [document],
+        // Weather-only runs skip retrieval, so the library and the one "sub-question" are set here.
+        // (A mixed run rebuilds the library in the coverage check, tool reading first.)
+        library: buildLibrary([], [document]),
+        subQuestions: state.route === "weather" ? [state.topic] : [],
+      };
+    } catch (error) {
+      logStep("Weather tool", `failed (${errorMessage(error)}) - falling back to research`);
+      return {
+        route: "research" as const,
+        runNotes: [
+          `The weather tool could not get the current weather for "${state.weatherCity}" (${errorMessage(error)}), ` +
+            "so this brief comes from the research sources only and contains no live weather data.",
+        ],
+      };
+    }
+  };
+
+  const unsupported = () => {
+    logStep("Router", "needs live data that no tool provides - reporting that instead of guessing");
+    return {
+      draft:
+        "## Overview\n\nThis question needs live, up-to-the-minute data (for example prices, scores, traffic or " +
+        "breaking news) that this assistant has no tool for, and the research sources (Wikipedia, arXiv, Hacker News) " +
+        "cannot provide it. No brief was written rather than guessing.",
+      runNotes: ["The routing agent classified this topic as needing live data other than weather, which is not available."],
+    };
+  };
 
   const plan = async (state: typeof ResearchState.State) => {
     const startedAt = Date.now();
-    const subQuestions = await agents.plan(state.topic);
+    const subQuestions = await agents.plan(state.researchTopic || state.topic);
     logStep("Planner", `split the topic into ${subQuestions.length} sub-questions (${since(startedAt)}):`);
     subQuestions.forEach((question, i) => console.log(`             ${i + 1}. ${question}`));
     return { subQuestions };
@@ -108,7 +176,7 @@ export function createResearchGraph({ agents, fetchers, saveReport }: GraphDepen
 
   // Deterministic check - no AI. Runs after ALL parallel retrieval branches have finished.
   const coverage = (state: typeof ResearchState.State) => {
-    const library = buildLibrary(state.retrieved);
+    const library = buildLibrary(state.retrieved, state.toolDocs);
     const uncovered = findUncoveredSubQuestions(state.subQuestions.length, state.retrieved);
     const round = state.retrievalRounds + 1;
 
@@ -151,10 +219,16 @@ export function createResearchGraph({ agents, fetchers, saveReport }: GraphDepen
   // lists the relevant excerpts that were found, unedited.
   const summarize = async (state: typeof ResearchState.State) => {
     const startedAt = Date.now();
+    // In a mixed run the planner only saw the research half of the topic, so the weather reading
+    // would have no question to belong to and the summarizer would leave it out (seen live).
+    const subQuestions =
+      state.route === "mixed" && state.toolDocs.length > 0
+        ? [`What is the current weather in ${state.weatherCity}?`, ...state.subQuestions]
+        : state.subQuestions;
     try {
       const notes = await agents.summarize({
         topic: state.topic,
-        subQuestions: state.subQuestions,
+        subQuestions,
         library: state.library,
       });
       logStep("Summarizer", `condensed ${state.library.length} sources into notes (${since(startedAt)})`);
@@ -218,7 +292,7 @@ export function createResearchGraph({ agents, fetchers, saveReport }: GraphDepen
       body: state.draft,
       library: state.library,
       runNotes,
-      generatedOn: new Date().toISOString().slice(0, 10),
+      generatedOn: `${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`,
     });
     const reportPath = await saveReport(state.topic, report);
     logStep("Saved", reportPath);
@@ -226,6 +300,12 @@ export function createResearchGraph({ agents, fetchers, saveReport }: GraphDepen
   };
 
   // ---- Routers: these are the diamonds in the flowchart ----
+
+  const afterRoute = (state: typeof ResearchState.State) =>
+    state.route === "weather" || state.route === "mixed" ? "weatherTool" : state.route === "unsupported" ? "unsupported" : "plan";
+
+  // Weather-only goes straight to summarizing; a mixed run (or a failed tool) goes on to research.
+  const afterWeather = (state: typeof ResearchState.State) => (state.route === "weather" ? "summarize" : "plan");
 
   // Fan-out: one Send per sub-question makes LangGraph run that many `retrieve` branches in parallel.
   const fanOutRetrieval = (state: typeof ResearchState.State) =>
@@ -258,6 +338,9 @@ export function createResearchGraph({ agents, fetchers, saveReport }: GraphDepen
     state.citationProblems.length > 0 && state.draftCount < LIMITS.maxDrafts ? "write" : "save";
 
   return new StateGraph(ResearchState)
+    .addNode("router", route)
+    .addNode("weatherTool", weatherTool)
+    .addNode("unsupported", unsupported)
     .addNode("plan", plan)
     .addNode("retrieve", retrieve)
     .addNode("coverage", coverage)
@@ -266,7 +349,10 @@ export function createResearchGraph({ agents, fetchers, saveReport }: GraphDepen
     .addNode("write", write)
     .addNode("checkCitations", checkCitationsNode)
     .addNode("save", save)
-    .addEdge(START, "plan")
+    .addEdge(START, "router")
+    .addConditionalEdges("router", afterRoute, ["weatherTool", "unsupported", "plan"])
+    .addConditionalEdges("weatherTool", afterWeather, ["summarize", "plan"])
+    .addEdge("unsupported", "save")
     .addConditionalEdges("plan", fanOutRetrieval, ["retrieve"])
     .addEdge("retrieve", "coverage")
     .addConditionalEdges("coverage", afterCoverage, ["retrieve", "summarize", "noSources"])

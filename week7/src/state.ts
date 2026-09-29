@@ -1,6 +1,7 @@
 import { ReducedValue, StateSchema } from "@langchain/langgraph";
 import { z } from "zod";
 
+import { sourceDocumentSchema } from "./sources/types.js";
 import { numberedSourceSchema, retrievedBatchSchema } from "./types.js";
 
 // Parallel branches all write to the same field at once. A plain field would keep only the last
@@ -19,6 +20,12 @@ function appended<T extends z.ZodType>(item: T) {
  */
 export const ResearchState = new StateSchema({
   topic: z.string(),
+
+  // Router: how the topic is answered, and the live-tool readings it produced
+  route: z.enum(["research", "weather", "mixed", "unsupported"]).default("research"),
+  weatherCity: z.string().default(""),
+  researchTopic: z.string().default(""), // the part of a MIXED topic that still needs research
+  toolDocs: appended(sourceDocumentSchema),
 
   // Planner
   subQuestions: z.array(z.string()).default(() => []),

@@ -36,3 +36,14 @@ export const numberedSourceSchema = sourceDocumentSchema.extend({
   subQuestionIndex: z.number(),
 });
 export type NumberedSource = z.infer<typeof numberedSourceSchema>;
+
+// The router's decision about how a topic gets answered (see agents/router.ts).
+//   research    - the normal pipeline: plan, search the three sources, summarize, write
+//   weather     - live data: only the weather tool can answer it
+//   mixed       - both: the weather tool for `city`, and research for `researchTopic`
+//   unsupported - needs live data (prices, scores, news of today...) that no tool provides
+export type RouteDecision =
+  | { kind: "research" }
+  | { kind: "weather"; city: string }
+  | { kind: "mixed"; city: string; researchTopic: string }
+  | { kind: "unsupported" };

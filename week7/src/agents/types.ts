@@ -1,12 +1,15 @@
 import type { SourceDocument } from "../sources/types.js";
-import type { NumberedSource, QueryPlan } from "../types.js";
+import type { NumberedSource, QueryPlan, RouteDecision } from "../types.js";
 
 /**
- * The four AI agents, as the graph sees them. The graph depends on this interface and not on any
+ * The AI agents, as the graph sees them. The graph depends on this interface and not on any
  * particular model, which is what lets the tests swap in scripted agents and check the routing
  * (retries, redrafts) deterministically, without a live model or network.
  */
 export interface Agents {
+  /** Routing agent: decides whether the topic needs research, a live-data tool, or both. */
+  route(topic: string): Promise<RouteDecision>;
+
   /** Planning agent: splits a topic into focused sub-questions. */
   plan(topic: string): Promise<string[]>;
 

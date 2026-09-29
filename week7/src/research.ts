@@ -3,7 +3,7 @@
  *
  * Usage:  npm run research -- "How do LangGraph agents differ from LangChain agents?"
  *
- * Four agents (planning, retrieval, summarization, final answer) are coordinated by the graph
+ * Five agents (routing, planning, retrieval, summarization, final answer) are coordinated by the graph
  * in graph.ts. The result is saved as a markdown brief with numbered citations under reports/.
  */
 
@@ -12,6 +12,7 @@ import { createResearchGraph } from "./graph.js";
 import { getCloudChatModel } from "./models.js";
 import { saveReportToDisk } from "./report.js";
 import { DEFAULT_FETCHERS } from "./sources/index.js";
+import { openMeteoWeather } from "./tools/weather.js";
 import { printSectionHeader } from "./utils.js";
 
 // A whole run makes a dozen or so model calls plus web requests, and free-tier latency swings
@@ -33,6 +34,7 @@ async function main(): Promise<void> {
   const graph = createResearchGraph({
     agents: createAgents(getCloudChatModel()),
     fetchers: DEFAULT_FETCHERS,
+    weather: openMeteoWeather,
     saveReport: saveReportToDisk,
   });
 

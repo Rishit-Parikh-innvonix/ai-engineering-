@@ -10,11 +10,13 @@ import {
   findUncoveredSubQuestions,
   keepCitedSources,
   parseRelevantNumbers,
+  parseRouteReply,
   previousQueriesFor,
   slugify,
   stripSourceLabel,
 } from "./logic.js";
 import type { SourceDocument, SourceKind } from "./sources/types.js";
+import { buildWeatherDocument, describeWeatherCode, pickPlace, type GeocodedPlace } from "./tools/weather.js";
 import { queryPlanSchema, type RetrievedBatch } from "./types.js";
 
 const doc = (kind: SourceKind, name: string, text = "some text"): SourceDocument => ({
@@ -176,4 +178,93 @@ test("slugify makes safe, bounded file names", () => {
   assert.equal(slugify("How do LangGraph agents differ from LangChain agents?"), "how-do-langgraph-agents-differ-from-langchain-agents");
   assert.equal(slugify("???"), "research-brief");
   assert.ok(slugify("x".repeat(200)).length <= 60);
+});
+
+/* ---------- router reply parsing ---------- */
+
+test("parseRouteReply: reads each of the four route shapes", () => {
+  assert.deepEqual(parseRouteReply("RESEARCH"), { kind: "research" });
+  assert.deepEqual(parseRouteReply("  research.\n"), { kind: "research" });
+  assert.deepEqual(parseRouteReply("UNSUPPORTED_LIVE"), { kind: "unsupported" });
+  assert.deepEqual(parseRouteReply("WEATHER: Ahmedabad"), { kind: "weather", city: "Ahmedabad" });
+  assert.deepEqual(parseRouteReply("weather : New York, US"), { kind: "weather", city: "New York, US" });
+  assert.deepEqual(parseRouteReply("MIXED: Surat | why the monsoon happens in Gujarat"), {
+    kind: "mixed",
+    city: "Surat",
+    researchTopic: "why the monsoon happens in Gujarat",
+  });
+});
+
+test("parseRouteReply: rambling, empty or unusable replies throw so the model is asked again", () => {
+  assert.throws(() => parseRouteReply("I think this is a weather question"), /Unexpected router reply/);
+  assert.throws(() => parseRouteReply("WEATHER:"), /Unexpected router reply/);
+  assert.throws(() => parseRouteReply("WEATHER: 12"), /unusable city/);
+  assert.throws(() => parseRouteReply("MIXED: Surat"), /Unexpected router reply|no research question/);
+  assert.throws(() => parseRouteReply("MIXED: Surat | "), /no research question/);
+});
+
+/* ---------- live-tool readings in the library ---------- */
+
+test("buildLibrary: a weather reading is numbered first and belongs to no sub-question", () => {
+  const library = buildLibrary([batch(0, [doc("wikipedia", "a")])], [doc("weather", "now")]);
+  assert.deepEqual(library.map((s) => [s.id, s.kind, s.subQuestionIndex]), [
+    [1, "weather", -1],
+    [2, "wikipedia", 0],
+  ]);
+});
+
+/* ---------- weather tool: pure parts ---------- */
+
+const place = (over: Partial<GeocodedPlace>): GeocodedPlace => ({
+  name: "Ahmedabad",
+  latitude: 23.02,
+  longitude: 72.58,
+  country: "India",
+  country_code: "IN",
+  admin1: "Gujarat",
+  ...over,
+});
+
+test("pickPlace: takes the top result, or the one matching a country/region qualifier", () => {
+  const india = place({});
+  const pakistan = place({ country: "Pakistan", country_code: "PK", admin1: "Khyber Pakhtunkhwa" });
+  assert.equal(pickPlace([india, pakistan], ""), india);
+  assert.equal(pickPlace([india, pakistan], "Pakistan"), pakistan);
+  assert.equal(pickPlace([india, pakistan], "pk"), pakistan);
+  assert.equal(pickPlace([india, pakistan], "Atlantis"), india); // unknown qualifier: top result
+  assert.equal(pickPlace([], "India"), undefined);
+});
+
+test("describeWeatherCode: maps WMO codes and admits unknown ones", () => {
+  assert.equal(describeWeatherCode(1), "mainly clear");
+  assert.equal(describeWeatherCode(95), "thunderstorm");
+  assert.match(describeWeatherCode(1234), /unrecognised condition \(WMO code 1234\)/);
+});
+
+test("buildWeatherDocument: every number in the text comes from the API response", () => {
+  const document = buildWeatherDocument(
+    place({}),
+    {
+      timezone: "Asia/Kolkata",
+      current: {
+        time: "2026-09-29T13:00",
+        temperature_2m: 34,
+        apparent_temperature: 36.1,
+        relative_humidity_2m: 42,
+        precipitation: 0,
+        wind_speed_10m: 3.2,
+        weather_code: 1,
+      },
+      current_units: { temperature_2m: "°C", relative_humidity_2m: "%", precipitation: "mm", wind_speed_10m: "km/h" },
+    },
+    "https://api.example.com/forecast"
+  );
+  assert.equal(document.kind, "weather");
+  assert.equal(document.title, "Current weather in Ahmedabad, Gujarat, India");
+  assert.equal(document.url, "https://api.example.com/forecast");
+  assert.match(document.text, /Observed: 2026-09-29 13:00 local time \(Asia\/Kolkata\)/);
+  assert.match(document.text, /Conditions: mainly clear/);
+  assert.match(document.text, /Temperature: 34 °C \(feels like 36.1 °C\)/);
+  assert.match(document.text, /Relative humidity: 42%/);
+  assert.match(document.text, /Wind speed: 3.2 km\/h/);
 });

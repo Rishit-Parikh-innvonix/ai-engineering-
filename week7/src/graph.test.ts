@@ -10,13 +10,14 @@ import { test, type TestContext } from "node:test";
 import type { Agents } from "./agents/types.js";
 import { createResearchGraph } from "./graph.js";
 import { LIMITS } from "./logic.js";
-import type { SourceDocument, SourceFetcher, SourceKind } from "./sources/types.js";
+import type { SearchKind, SourceDocument, SourceFetcher } from "./sources/types.js";
+import type { WeatherTool } from "./tools/weather.js";
 import type { QueryPlan } from "./types.js";
 
-const KINDS: SourceKind[] = ["wikipedia", "arxiv", "hackernews"];
+const KINDS: SearchKind[] = ["wikipedia", "arxiv", "hackernews"];
 
 // By default every source returns one document whose URL depends on the query it was given.
-function makeFetchers(handler?: (kind: SourceKind, query: string) => SourceDocument[]): SourceFetcher[] {
+function makeFetchers(handler?: (kind: SearchKind, query: string) => SourceDocument[]): SourceFetcher[] {
   return KINDS.map((kind) => ({
     kind,
     label: kind,
@@ -30,6 +31,7 @@ function makeFetchers(handler?: (kind: SourceKind, query: string) => SourceDocum
 function makeAgents(overrides: Partial<Agents> = {}) {
   const calls = { plan: 0, craftQueries: [] as { subQuestion: string; previousQueries: QueryPlan[] }[], summarize: 0, write: 0 };
   const agents: Agents = {
+    route: async () => ({ kind: "research" }), // by default every topic is plain research
     plan: async () => {
       calls.plan++;
       return ["question A", "question B"];
@@ -54,12 +56,21 @@ function makeAgents(overrides: Partial<Agents> = {}) {
   return { agents, calls };
 }
 
-async function run(t: TestContext, agents: Agents, fetchers: SourceFetcher[]) {
+const WEATHER_DOC: SourceDocument = {
+  kind: "weather",
+  title: "Current weather in Testville",
+  url: "https://example.com/weather",
+  text: "Temperature: 21 °C.",
+};
+const workingWeather: WeatherTool = { lookup: async () => WEATHER_DOC };
+
+async function run(t: TestContext, agents: Agents, fetchers: SourceFetcher[], weather: WeatherTool = workingWeather) {
   t.mock.method(console, "log", () => {}); // keep the test output readable
   const saved: string[] = [];
   const graph = createResearchGraph({
     agents,
     fetchers,
+    weather,
     saveReport: async (_topic, markdown) => {
       saved.push(markdown);
       return "memory://report";
@@ -246,4 +257,95 @@ test("if the retrieval agent's query-writing fails, the question text is used as
   assert.equal(calls.summarize, 1);
   assert.ok(queriesSeen.includes("question A"));
   assert.match(saved[0], /could not write search queries for "question A" \(model timed out\)/);
+});
+
+/* ---------- The router and the weather tool ---------- */
+
+test("weather only: the tool answers, and no planning or searching happens", async (t) => {
+  const searched: string[] = [];
+  const { agents, calls } = makeAgents({
+    route: async () => ({ kind: "weather", city: "Testville" }),
+    summarize: async ({ library, subQuestions }) => {
+      assert.deepEqual(subQuestions, ["test topic"]);
+      assert.equal(library.length, 1);
+      return "Temperature is 21 °C [1].";
+    },
+    write: async () => "## Overview\n\nIt is 21 °C [1].",
+  });
+  const { result, saved } = await run(
+    t,
+    agents,
+    makeFetchers((kind, query) => {
+      searched.push(query);
+      return [];
+    })
+  );
+
+  assert.equal(calls.plan, 0);
+  assert.equal(calls.craftQueries.length, 0);
+  assert.deepEqual(searched, []);
+  assert.equal(result.library[0].kind, "weather");
+  assert.match(saved[0], /1\. \*\*Open-Meteo weather\*\*: \[Current weather in Testville\]\(https:\/\/example.com\/weather\)/);
+  assert.doesNotMatch(saved[0], /Warning/); // a single source is fine for a single reading
+});
+
+test("mixed: the weather reading and the research sources end up in one library, weather first", async (t) => {
+  const plannedFor: string[] = [];
+  let summarizedQuestions: string[] = [];
+  const { agents } = makeAgents({
+    route: async () => ({ kind: "mixed", city: "Testville", researchTopic: "why monsoons happen" }),
+    plan: async (topic) => {
+      plannedFor.push(topic);
+      return ["question A"];
+    },
+    summarize: async ({ subQuestions }) => {
+      summarizedQuestions = subQuestions;
+      return "notes [1][2]";
+    },
+  });
+  const { result } = await run(t, agents, makeFetchers());
+
+  assert.deepEqual(plannedFor, ["why monsoons happen"]); // only the non-weather part is researched
+  assert.equal(result.library[0].kind, "weather");
+  assert.equal(result.library[0].id, 1);
+  assert.equal(result.library.length, 4); // 1 weather + 3 searched sources
+  // the summarizer is explicitly asked about the weather, or it would leave the reading out
+  assert.deepEqual(summarizedQuestions, ["What is the current weather in Testville?", "question A"]);
+});
+
+test("weather tool failure: falls back to research and the report says there is no live data", async (t) => {
+  const { agents, calls } = makeAgents({ route: async () => ({ kind: "weather", city: "Nowhereville" }) });
+  const { result, saved } = await run(t, agents, makeFetchers(), {
+    lookup: async () => {
+      throw new Error('No place called "Nowhereville" was found.');
+    },
+  });
+
+  assert.equal(calls.plan, 1);
+  assert.ok(result.library.every((source) => source.kind !== "weather"));
+  assert.match(saved[0], /weather tool could not get the current weather for "Nowhereville"/);
+  assert.match(saved[0], /contains no live weather data/);
+});
+
+test("unsupported live data: an honest report, with no planning, searching or writing", async (t) => {
+  const { agents, calls } = makeAgents({ route: async () => ({ kind: "unsupported" }) });
+  const { saved } = await run(t, agents, makeFetchers());
+
+  assert.equal(calls.plan, 0);
+  assert.equal(calls.craftQueries.length, 0);
+  assert.equal(calls.write, 0);
+  assert.match(saved[0], /needs live, up-to-the-minute data/);
+  assert.match(saved[0], /No sources are cited/);
+});
+
+test("if the routing agent fails, the topic is researched as usual and the report says so", async (t) => {
+  const { agents, calls } = makeAgents({
+    route: async () => {
+      throw new Error("model timed out");
+    },
+  });
+  const { saved } = await run(t, agents, makeFetchers());
+
+  assert.equal(calls.plan, 1);
+  assert.match(saved[0], /routing agent failed \(model timed out\)/);
 });
