@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.env
+
+# Generated research briefs (see src/research.ts) - real output, not source.
+reports/
