@@ -1,0 +1,66 @@
+[
+  {
+    "id": "p1",
+    "name": "Wireless Headphones",
+    "category": "Electronics",
+    "price": 49.99,
+    "stock": 12,
+    "description": "Over-ear Bluetooth headphones with 20-hour battery life."
+  },
+  {
+    "id": "p2",
+    "name": "Mechanical Keyboard",
+    "category": "Electronics",
+    "price": 89.0,
+    "stock": 0,
+    "description": "Compact 75% layout keyboard with hot-swappable switches."
+  },
+  {
+    "id": "p3",
+    "name": "USB-C Charging Cable",
+    "category": "Electronics",
+    "price": 9.99,
+    "stock": 54,
+    "description": "2-meter braided USB-C to USB-C cable, 100W fast charging."
+  },
+  {
+    "id": "p4",
+    "name": "Ceramic Coffee Mug",
+    "category": "Home",
+    "price": 14.5,
+    "stock": 30,
+    "description": "350ml matte-finish mug, dishwasher and microwave safe."
+  },
+  {
+    "id": "p5",
+    "name": "Standing Desk Mat",
+    "category": "Home",
+    "price": 34.99,
+    "stock": 7,
+    "description": "Anti-fatigue foam mat for standing desks, 60x90cm."
+  },
+  {
+    "id": "p6",
+    "name": "Learn Python in a Weekend",
+    "category": "Books",
+    "price": 19.99,
+    "stock": 3,
+    "description": "A beginner-friendly introduction to Python programming."
+  },
+  {
+    "id": "p7",
+    "name": "Noise-Cancelling Earbuds",
+    "category": "Electronics",
+    "price": 59.0,
+    "stock": 18,
+    "description": "True wireless earbuds with active noise cancellation."
+  },
+  {
+    "id": "p8",
+    "name": "Desk Lamp",
+    "category": "Home",
+    "price": 22.0,
+    "stock": 0,
+    "description": "Adjustable LED desk lamp with 3 brightness levels."
+  }
+]

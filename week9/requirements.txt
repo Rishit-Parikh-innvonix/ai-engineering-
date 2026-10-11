@@ -1,0 +1,14 @@
+# The standalone `fastmcp` package (4.x) requires mcp>=2, but langchain-mcp-adapters only
+# supports mcp<2 (checked directly: 0.3.2 fails to import against mcp 2.x with
+# "ImportError: cannot import name 'RequestContext'"). The mcp SDK itself ships the exact same
+# FastMCP class built in (mcp.server.fastmcp.FastMCP), so server.py imports from there instead -
+# same decorator API (@mcp.resource, @mcp.tool, mcp.run()), zero version conflict, one less
+# dependency.
+mcp<2
+langchain-mcp-adapters>=0.3,<0.4
+langchain>=1.4,<2
+langchain-openai>=1.7,<2
+langchain-core>=1.6,<2
+langgraph>=1.2,<2
+python-dotenv>=1.2,<2
+pytest>=9,<10
