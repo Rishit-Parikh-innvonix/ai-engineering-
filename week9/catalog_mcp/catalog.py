@@ -7,7 +7,7 @@ logic.ts) so the actual business rules can be unit-tested without a server or a 
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import TypedDict
+from typing_extensions import TypedDict
 
 from catalog_mcp import config
 

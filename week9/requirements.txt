@@ -5,6 +5,12 @@
 # same decorator API (@mcp.resource, @mcp.tool, mcp.run()), zero version conflict, one less
 # dependency.
 mcp<2
+# catalog.py's Product TypedDict needs this directly (not just transitively via pydantic):
+# plain typing.TypedDict on Python <3.12 doesn't carry the metadata Pydantic's schema
+# generation needs for a Union return type (Product | dict[str, str] in server.py's
+# one_product resource) - confirmed live via "Please use typing_extensions.TypedDict
+# instead of typing.TypedDict on Python < 3.12" from pydantic itself.
+typing-extensions>=4.12
 langchain-mcp-adapters>=0.3,<0.4
 langchain>=1.4,<2
 langchain-openai>=1.7,<2
@@ -12,3 +18,10 @@ langchain-core>=1.6,<2
 langgraph>=1.2,<2
 python-dotenv>=1.2,<2
 pytest>=9,<10
+
+# Exercise 3: local "typed decision" classifier used to pick which catalog action a question
+# needs, instead of a cloud LLM deciding via tool-calling (see laya_router.py). Pulls in torch
+# and transformers - confirmed working on CPU (device="cpu" in laya_router.py), no GPU needed.
+# First call downloads a checkpoint from Hugging Face Hub (~5 files, took a few minutes here)
+# and caches it under ~/.cache/huggingface after that.
+laya>=0.4

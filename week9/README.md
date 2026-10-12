@@ -66,6 +66,77 @@ name and description. Verified live:
 - *"Is the mechanical keyboard available right now?"* -> calls `search_products`, correctly
   reports it as out of stock (the data has `"stock": 0` for that product).
 
+## Exercise 3 - Laya decides, not the LLM (`catalog_mcp/laya_router.py`)
+
+Exercise 2's LLM does several jobs in one tool-calling step: decide WHICH tool a question
+needs, AND extract the right argument for it (a search term, a product id). This exercise
+replaces that whole decision layer with [Laya](https://github.com/NandhaKishorM/laya) - a
+small, local, non-generative "typed decision" model (421M params, runs on CPU here) that does
+a single forward pass over text and returns a calibrated probability per labeled option. It
+classifies; it never generates or extracts free text - and getting that distinction right
+drove the actual design here.
+
+**The first version of this exercise got the fit wrong.** It used Laya only to pick the
+*action*, then tried to patch the leftover "which product / which search term" problem with
+regex and a plain-substring catalog search over the raw question - asking plain Python to do
+free-text extraction Laya itself can't do. That kept failing: a full sentence like *"What
+electronics do you sell for under $50?"* never substring-matches a product's name or
+description, so the fallback search returned nothing.
+
+**The fix: stop asking anything to extract free text. Ask Laya more questions instead.** This
+catalog is small and fixed (8 products, 3 categories) - so "which product does this question
+mean" and "which category" are themselves fixed label sets, exactly what `choice` questions are
+built for. `laya_router.py` builds those labels directly from the live catalog data (`p["id"]`
+-> `p["name"] - p["description"]`, and each unique category), so whatever Laya picks is a
+*guaranteed-valid* product id or category string - never something a fallback step has to
+validate or search for afterward. All three questions - action, product, category - are
+answered in **one forward pass** (Laya's own docs recommend batching questions per call where
+possible), not three separate model calls.
+
+Verified live, over the same 3 demo questions as Exercise 2:
+
+| Question | action | product | category | Result |
+|---|---|---|---|---|
+| "Do you have wireless headphones in stock?" | `check_stock` (0.84) | `p1` (0.78) | Electronics (0.62) | "Wireless Headphones (p1) has 12 unit(s) in stock." |
+| "What electronics do you sell for under $50?" | `search_products` (0.17) | none (0.24) | **Electronics (0.86)** | all 4 electronics products returned |
+| "Is the mechanical keyboard available right now?" | `one_product` (0.05) | **p2 (0.61)** | Electronics (0.32) | full product details, including `"stock": 0` |
+
+All three now resolve to a real, correct result - no regex, no fallback search, no "couldn't
+resolve" dead ends. `client.py`'s `ask_with_laya()` uses `category` for search when Laya found
+one (a category name is always a literal substring of the category field - guaranteed to
+match), falls back to the *chosen product's actual name* when it found a specific product
+instead, and only reports genuine ambiguity when neither question resolved to anything.
+
+**What this still doesn't do, honestly:** question 2's "under $50" is never applied - Exercise
+2's LLM filtered by price itself when writing its final answer; this pipeline has no price-
+filtering step, because a price range isn't a label from a fixed set, it's arithmetic over
+numbers. That's a real, structural gap, not a bug to patch with more `choice` questions - it's
+the line between "classify among known options" (what Laya does well) and "reason over
+arbitrary values" (what still needs something generative).
+
+One more honest caveat, confirmed live: this checkpoint logs
+`RuntimeWarning: laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]`
+on load - some of its confidence values get clamped and are explicitly flagged as
+uncalibrated. The low `action_confidence` scores above (0.17, 0.05) are real signals of
+genuine uncertainty either way (the action label set has real ambiguity - is "available right
+now" a `check_stock` or a `one_product` question? - and that caveat doesn't invalidate it), but
+treat any single confidence number with some skepticism rather than as a precise probability.
+
+**The actual lesson:** a 421M-parameter local classifier can correctly resolve every part of
+these questions that's genuinely a choice among a small, known set - action, product, and
+category all qualify once you build the label set from real data instead of trying to make the
+model extract text. What it can't do is arithmetic reasoning (price filtering) or open-ended
+extraction - those still need a generative model. The first implementation failed because it
+tried to use a classifier for an extraction job; the fix wasn't a better fallback, it was
+reframing the extraction problem as more classification.
+
+```
+python -m catalog_mcp       # runs Exercise 3 automatically after Exercise 1 and 2
+```
+
+First run downloads Laya's checkpoint from Hugging Face Hub (~5 files, took a few minutes
+here); cached under `~/.cache/huggingface` after that, so later runs load it near-instantly.
+
 ## Two FastMCPs - a real gotcha worth knowing
 
 There are two different `FastMCP` implementations on PyPI:
@@ -107,7 +178,8 @@ week9/
   catalog_mcp/
     catalog.py              pure search/stock logic - no MCP, no AI
     server.py                the MCP server (Exercise 1): resources + tools
-    client.py                 the MCP client + agent (Exercise 2)
+    client.py                 the MCP client + agent (Exercise 2) + ask_with_laya (Exercise 3)
+    laya_router.py             Laya "choice" question + action routing (Exercise 3)
     __main__.py                python -m catalog_mcp entry point
     config.py, models.py        OpenRouter key/model (same pattern as week7-py/week8)
   tests/

@@ -8,7 +8,7 @@ One question:   python -m catalog_mcp "Do you have the Python book in stock?"
 import asyncio
 import sys
 
-from catalog_mcp.client import ask, build_client
+from catalog_mcp.client import ask, ask_with_laya, build_client
 
 DEMO_QUESTIONS = [
     "Do you have wireless headphones in stock?",
@@ -48,6 +48,10 @@ async def main() -> None:
     questions = [" ".join(sys.argv[1:])] if len(sys.argv) > 1 else DEMO_QUESTIONS
     for question in questions:
         await ask(client, question)
+
+    print_header("Exercise 3: Laya decides which action to take, instead of the LLM")
+    for question in questions:
+        await ask_with_laya(client, question)
 
 
 if __name__ == "__main__":
