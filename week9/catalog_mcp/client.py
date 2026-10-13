@@ -8,6 +8,7 @@ on their name and description alone, the same way week6's assistant used the fil
 memory servers without that project's code ever importing them.
 """
 
+import json
 import sys
 
 from langchain.agents import create_agent
@@ -62,21 +63,34 @@ async def _call_tool(tools: list, name: str, args: dict) -> str:
     return await tool.ainvoke(args)
 
 
+def _as_products(raw) -> list[dict]:
+    # langchain-mcp-adapters returns a list tool result as one content block per item - e.g.
+    # [{"type": "text", "text": '{"id": "p1", ...}'}, ...], not a single JSON array - so each
+    # block's "text" needs parsing separately to get back the actual product dicts.
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict) and "text" in raw[0]:
+        return [json.loads(block["text"]) for block in raw]
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if isinstance(raw, dict) and "error" in raw:
+        return []
+    return raw if isinstance(raw, list) else [raw]
+
+
 async def ask_with_laya(client: MultiServerMCPClient, question: str) -> None:
-    """Exercise 3: the same questions as ask() above, but every decision - which action, which
-    product, which category - comes from Laya's local classifier in one forward pass, instead
-    of a cloud LLM deciding via tool-calling. See laya_router.py for why "product" and
-    "category" are themselves classification questions here, not something extracted from free
-    text afterward - that's what makes this a correct fit for what Laya actually does."""
+    """Exercise 3: action and category come from Laya's local classifier in one forward pass.
+    "Which exact product" is deliberately NOT asked of Laya - see laya_router.py for why that
+    doesn't scale - it's resolved by a real search call instead (catalog.search_products, via
+    the search_products tool), the same way a real system would handle "which one of
+    potentially thousands of rows does this match" rather than a fixed classification label."""
     tools = await client.get_tools(server_name="catalog")
 
     print(f"You ask: {question}")
     decision = laya_router.decide(question)
     action = decision["action"]
+    category = decision["category"]
     print(
         f"  -> action={action} ({decision['action_confidence']})  "
-        f"product={decision['product']} ({decision['product_confidence']})  "
-        f"category={decision['category']} ({decision['category_confidence']})"
+        f"category={category} ({decision['category_confidence']})"
     )
 
     if action == "all_products":
@@ -85,31 +99,28 @@ async def ask_with_laya(client: MultiServerMCPClient, question: str) -> None:
         return
 
     if action == "search_products":
-        # category/product are themselves classification questions over the live catalog (see
-        # laya_router.py), so whichever one Laya picked is already a guaranteed-valid
-        # category/name string - no regex, no extraction, no substring-match guesswork.
-        if decision["category"] != laya_router.NO_CATEGORY:
-            query = decision["category"]
-        elif decision["product"] != laya_router.NO_PRODUCT:
-            query = laya_router.product_name(decision["product"])
-        else:
-            print(
-                "\nResult: Laya found no specific product or category in this request, so "
-                "there's no safe search query to run (this is the genuinely ambiguous case - "
-                "a fully open-ended search term still needs a generative model, not a "
-                "classifier, to invent).\n"
-            )
-            return
-        result = await _call_tool(tools, "search_products", {"query": query})
-        print(f"\nResult (searched {query!r}):\n{result}\n")
+        # Browsing: category (a guaranteed-valid, bounded label) is a good search query when
+        # Laya found one; fall back to the raw question text otherwise - real search handles
+        # arbitrary free text fine, which is exactly the part a fixed-label classifier can't do.
+        search_query = category if category != laya_router.NO_CATEGORY else question
+        result = await _call_tool(tools, "search_products", {"query": search_query})
+        print(f"\nResult (searched {search_query!r}):\n{result}\n")
         return
 
-    # check_stock / one_product: the product choice IS the id, already validated by construction
-    # (it was one of the labels Laya was given) - nothing left to resolve.
-    product_id = decision["product"]
-    if product_id == laya_router.NO_PRODUCT:
-        print("\nResult: Laya didn't identify a specific product for this request.\n")
+    # check_stock / one_product both need exactly ONE specific product, so the search query must
+    # be the specific words in the question itself (e.g. "wireless headphones"), NOT the broad
+    # category - "Electronics" alone matches several products and can only ever be ambiguous
+    # here. Resolve via search instead of a classification label, then handle the
+    # ambiguous/no-match cases explicitly - a real system can't just guess which one was meant.
+    matches = _as_products(await _call_tool(tools, "search_products", {"query": question}))
+    if not matches:
+        print(f"\nResult: no product matches {question!r}.\n")
         return
+    if len(matches) > 1:
+        names = ", ".join(f'{m["name"]} ({m["id"]})' for m in matches)
+        print(f"\nResult: {question!r} matches more than one product - {names}. Ask about one of these by name.\n")
+        return
+    product_id = matches[0]["id"]
 
     if action == "check_stock":
         result = await _call_tool(tools, "check_stock", {"product_id": product_id})

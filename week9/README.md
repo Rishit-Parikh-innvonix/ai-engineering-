@@ -73,62 +73,68 @@ needs, AND extract the right argument for it (a search term, a product id). This
 replaces that whole decision layer with [Laya](https://github.com/NandhaKishorM/laya) - a
 small, local, non-generative "typed decision" model (421M params, runs on CPU here) that does
 a single forward pass over text and returns a calibrated probability per labeled option. It
-classifies; it never generates or extracts free text - and getting that distinction right
-drove the actual design here.
+classifies; it never generates or extracts free text.
 
-**The first version of this exercise got the fit wrong.** It used Laya only to pick the
-*action*, then tried to patch the leftover "which product / which search term" problem with
-regex and a plain-substring catalog search over the raw question - asking plain Python to do
-free-text extraction Laya itself can't do. That kept failing: a full sentence like *"What
-electronics do you sell for under $50?"* never substring-matches a product's name or
-description, so the fallback search returned nothing.
+**Two versions of this exercise got the product question wrong, in opposite directions - both
+worth knowing about.** Version 1 used Laya only for *action*, then tried to patch "which
+product?" with regex and plain-substring search over the raw question - asking plain Python to
+extract free text Laya can't do. That failed outright: a full sentence never substring-matches
+a product field. Version 2 overcorrected: it gave Laya one classification label *per product*,
+which worked at 8 products but doesn't scale - at thousands of products you'd be scoring the
+question against thousands of candidate labels in a single forward pass, which is both slow and
+more error-prone (look-alike descriptions start out-competing the right one).
 
-**The fix: stop asking anything to extract free text. Ask Laya more questions instead.** This
-catalog is small and fixed (8 products, 3 categories) - so "which product does this question
-mean" and "which category" are themselves fixed label sets, exactly what `choice` questions are
-built for. `laya_router.py` builds those labels directly from the live catalog data (`p["id"]`
--> `p["name"] - p["description"]`, and each unique category), so whatever Laya picks is a
-*guaranteed-valid* product id or category string - never something a fallback step has to
-validate or search for afterward. All three questions - action, product, category - are
-answered in **one forward pass** (Laya's own docs recommend batching questions per call where
-possible), not three separate model calls.
+**The actual fix: Laya only answers what stays small forever - `action` and `category`.**
+Categories are bounded (a handful, maybe a few dozen, no matter how large the catalog grows),
+so that stays a correct classification question at any scale. "Which exact product" is handed
+instead to `catalog.search_products` - a real search index (SQLite FTS5, see `catalog.py`) built
+for exactly the kind of lookup that grows with the data, the same tool Exercise 2 already uses.
+`laya_router.py` builds the category label set directly from the live catalog data, so whatever
+Laya picks is always a guaranteed-valid category string.
 
-Verified live, over the same 3 demo questions as Exercise 2:
+Verified live:
 
-| Question | action | product | category | Result |
-|---|---|---|---|---|
-| "Do you have wireless headphones in stock?" | `check_stock` (0.84) | `p1` (0.78) | Electronics (0.62) | "Wireless Headphones (p1) has 12 unit(s) in stock." |
-| "What electronics do you sell for under $50?" | `search_products` (0.17) | none (0.24) | **Electronics (0.86)** | all 4 electronics products returned |
-| "Is the mechanical keyboard available right now?" | `one_product` (0.05) | **p2 (0.61)** | Electronics (0.32) | full product details, including `"stock": 0` |
+| Question | action | category | Result |
+|---|---|---|---|
+| "Is the mechanical keyboard available right now?" | `one_product` (0.05) | Electronics (0.32) | full product details for `p2`, including `"stock": 0` |
+| "Tell me about the USB-C charging cable" | `one_product` (0.01) | Electronics (0.39) | full product details for `p3` |
+| "What electronics do you sell for under $50?" | `search_products` (0.17) | **Electronics (0.86)** | all 4 electronics products returned (price filtering still needs Exercise 2's LLM - see below) |
+| "Do you have wireless headphones in stock?" | `check_stock` (0.84) | Electronics (0.62) | **ambiguous** - "wireless" matches both Headphones (p1) and Earbuds (p7); reported honestly instead of guessing |
 
-All three now resolve to a real, correct result - no regex, no fallback search, no "couldn't
-resolve" dead ends. `client.py`'s `ask_with_laya()` uses `category` for search when Laya found
-one (a category name is always a literal substring of the category field - guaranteed to
-match), falls back to the *chosen product's actual name* when it found a specific product
-instead, and only reports genuine ambiguity when neither question resolved to anything.
+`client.py`'s `ask_with_laya()`: for `search_products` (browsing), it searches by `category`
+when Laya found one, else the raw question. For `check_stock`/`one_product` (need exactly ONE
+product), it always searches using the raw question text - not the category, which is too
+broad and would almost always match several products - then explicitly handles 0 matches ("no
+product matches..."), exactly 1 match (resolved), or 2+ matches (reports the names and asks the
+user to be more specific, rather than silently picking one).
 
-**What this still doesn't do, honestly:** question 2's "under $50" is never applied - Exercise
-2's LLM filtered by price itself when writing its final answer; this pipeline has no price-
-filtering step, because a price range isn't a label from a fixed set, it's arithmetic over
-numbers. That's a real, structural gap, not a bug to patch with more `choice` questions - it's
-the line between "classify among known options" (what Laya does well) and "reason over
-arbitrary values" (what still needs something generative).
+**What this still doesn't do, honestly:**
+- *Price filtering* ("under $50") is never applied here - Exercise 2's LLM did that itself when
+  writing its final answer. A price range isn't a label from a fixed set, it's arithmetic over
+  numbers - a real, structural gap, not a bug to patch with more `choice` questions. That's the
+  line between "classify among known options" (what Laya does well) and "reason over arbitrary
+  values" (what still needs something generative).
+- *Shared-word ambiguity* ("wireless" matching both the headphones and the earbuds) is reported
+  as ambiguous rather than resolved, because a keyword search genuinely can't tell which one a
+  human would obviously mean - that distinction needs understanding, not just word overlap. A
+  generative LLM (Exercise 2) resolves this correctly because it actually reads the phrase
+  "wireless headphones" as a unit, not as two independent keywords.
+- A small, fixed stopword list (`_STOPWORDS` in `catalog.py`) keeps filler words ("the", "in",
+  "is", ...) from accidentally word-matching inside an unrelated product's name - without it,
+  "...in stock?" would spuriously match "Learn Python **in** a Weekend". A bigger catalog would
+  want a real stopword library, but the principle holds at any scale.
 
 One more honest caveat, confirmed live: this checkpoint logs
 `RuntimeWarning: laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]`
 on load - some of its confidence values get clamped and are explicitly flagged as
-uncalibrated. The low `action_confidence` scores above (0.17, 0.05) are real signals of
-genuine uncertainty either way (the action label set has real ambiguity - is "available right
-now" a `check_stock` or a `one_product` question? - and that caveat doesn't invalidate it), but
-treat any single confidence number with some skepticism rather than as a precise probability.
+uncalibrated. Treat any single confidence number with some skepticism rather than as a precise
+probability.
 
-**The actual lesson:** a 421M-parameter local classifier can correctly resolve every part of
-these questions that's genuinely a choice among a small, known set - action, product, and
-category all qualify once you build the label set from real data instead of trying to make the
-model extract text. What it can't do is arithmetic reasoning (price filtering) or open-ended
-extraction - those still need a generative model. The first implementation failed because it
-tried to use a classifier for an extraction job; the fix wasn't a better fallback, it was
-reframing the extraction problem as more classification.
+**The actual lesson:** a local classifier correctly resolves anything that's genuinely a choice
+among a small, known set - action and category qualify at any catalog size. "Which exact
+product" is a search/ranking problem, not a classification problem, the moment the catalog is
+large - and routing it to a real search index instead of a per-item label is what makes this
+design hold up from 8 products to thousands, instead of only working as a demo.
 
 ```
 python -m catalog_mcp       # runs Exercise 3 automatically after Exercise 1 and 2
@@ -176,7 +182,7 @@ week9/
   data/
     products.json          the catalog's actual data (8 products)
   catalog_mcp/
-    catalog.py              pure search/stock logic - no MCP, no AI
+    catalog.py              pure search/stock logic - no MCP, no AI (search is FTS5-backed)
     server.py                the MCP server (Exercise 1): resources + tools
     client.py                 the MCP client + agent (Exercise 2) + ask_with_laya (Exercise 3)
     laya_router.py             Laya "choice" question + action routing (Exercise 3)
