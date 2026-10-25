@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+
+# Generated research briefs - real output, not source.
+reports/
+
+# Saved run state (checkpoints)
+checkpoints.sqlite*
+
+# Generated trace files (brief/tracing.py) - real output, not source.
+traces/

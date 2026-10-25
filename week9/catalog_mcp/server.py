@@ -12,9 +12,15 @@ pattern week6's TypeScript MultiServerMCPClient uses - the client spawns this sc
 to it over stdin/stdout, no network port involved).
 """
 
+import logging
+
 from mcp.server.fastmcp import FastMCP
 
 from catalog_mcp import catalog
+
+# Quiet the MCP SDK's own per-request INFO logs (ListToolsRequest, CallToolRequest, ...) - this
+# runs in the server subprocess, so setting it here (not in client.py) is what actually mutes it.
+logging.getLogger("mcp").setLevel(logging.WARNING)
 
 mcp = FastMCP("product-catalog")
 

@@ -66,75 +66,86 @@ name and description. Verified live:
 - *"Is the mechanical keyboard available right now?"* -> calls `search_products`, correctly
   reports it as out of stock (the data has `"stock": 0` for that product).
 
-## Exercise 3 - Laya decides, not the LLM (`catalog_mcp/laya_router.py`)
+## Exercise 3 - Laya routes, the LLM resolves (`catalog_mcp/laya_router.py`)
 
-Exercise 2's LLM does several jobs in one tool-calling step: decide WHICH tool a question
-needs, AND extract the right argument for it (a search term, a product id). This exercise
-replaces that whole decision layer with [Laya](https://github.com/NandhaKishorM/laya) - a
-small, local, non-generative "typed decision" model (421M params, runs on CPU here) that does
-a single forward pass over text and returns a calibrated probability per labeled option. It
-classifies; it never generates or extracts free text.
+Exercise 2's LLM does two jobs in one tool-calling step: decide WHICH tool a question needs,
+AND extract the right argument for it (a search term, a product id, a price filter). This
+exercise splits those two jobs between two different kinds of model, each doing only what it's
+actually built for:
 
-**Two versions of this exercise got the product question wrong, in opposite directions - both
-worth knowing about.** Version 1 used Laya only for *action*, then tried to patch "which
-product?" with regex and plain-substring search over the raw question - asking plain Python to
-extract free text Laya can't do. That failed outright: a full sentence never substring-matches
-a product field. Version 2 overcorrected: it gave Laya one classification label *per product*,
-which worked at 8 products but doesn't scale - at thousands of products you'd be scoring the
-question against thousands of candidate labels in a single forward pass, which is both slow and
-more error-prone (look-alike descriptions start out-competing the right one).
+- [Laya](https://github.com/NandhaKishorM/laya) - a small, local, non-generative "typed
+  decision" model (421M params, runs on CPU here). It does a single forward pass over text and
+  returns a calibrated probability per labeled option from a FIXED set. It classifies; it never
+  generates or extracts free text.
+- The same cloud LLM Exercise 2 uses (via OpenRouter, free tier) - which IS built for free-text
+  extraction and reasoning (exact product names, "under $50" arithmetic, disambiguating
+  "wireless headphones" from "earbuds").
 
-**The actual fix: Laya only answers what stays small forever - `action` and `category`.**
-Categories are bounded (a handful, maybe a few dozen, no matter how large the catalog grows),
-so that stays a correct classification question at any scale. "Which exact product" is handed
-instead to `catalog.search_products` - a real search index (SQLite FTS5, see `catalog.py`) built
-for exactly the kind of lookup that grows with the data, the same tool Exercise 2 already uses.
-`laya_router.py` builds the category label set directly from the live catalog data, so whatever
-Laya picks is always a guaranteed-valid category string.
+**Three earlier attempts got this wrong by asking Laya (or plain code standing in for it) to do
+the LLM's job - worth knowing about, because the failure mode is the same each time.**
+1. Laya picked the action; plain regex + substring search tried to extract "which product" from
+   the raw question. Failed outright - a full sentence never substring-matches a product field.
+2. Laya was given one classification label *per product*. Worked at 8 products, doesn't scale -
+   at thousands of products you'd score the question against thousands of candidate labels in
+   one forward pass, both slow and error-prone.
+3. Laya picked action + category; "which exact product" was handed to a real search
+   (`catalog.search_products`), with a regex (`_price_limit()`) bolted on for "under $50". This
+   actually worked for most questions, but broke on genuine ambiguity ("wireless" matching both
+   Wireless Headphones and Noise-Cancelling Earbuds) - a keyword search can't tell which a human
+   obviously means, because that needs understanding a phrase as a unit, not word overlap.
 
-Verified live:
+Each attempt tried to make a classifier (or classifier-shaped plain code) do a free-text/
+reasoning job. **The fix: stop trying to resolve entities without an LLM.** Laya decides ONLY
+the action - a true 4-way multiple-choice question, exactly its fit - and that decision narrows
+which tool(s) the cloud LLM agent even gets to see. The LLM then resolves the exact product,
+applies any price filter, and writes the final answer itself, via real tool calls - the same
+mechanism Exercise 2 already uses correctly, just scoped to a smaller toolset:
 
-| Question | action | category | Result |
-|---|---|---|---|
-| "Is the mechanical keyboard available right now?" | `one_product` (0.05) | Electronics (0.32) | full product details for `p2`, including `"stock": 0` |
-| "Tell me about the USB-C charging cable" | `one_product` (0.01) | Electronics (0.39) | full product details for `p3` |
-| "What electronics do you sell for under $50?" | `search_products` (0.17) | **Electronics (0.86)** | all 4 electronics products returned (price filtering still needs Exercise 2's LLM - see below) |
-| "Do you have wireless headphones in stock?" | `check_stock` (0.84) | Electronics (0.62) | **ambiguous** - "wireless" matches both Headphones (p1) and Earbuds (p7); reported honestly instead of guessing |
+```
+question
+   │
+   ▼
+Laya classifies the ACTION (local, ~instant, zero API cost):
+   search_products | check_stock | one_product | all_products
+   │
+   ├─ all_products ───────────────────────► fetch the whole catalog resource directly
+   │                                          (unambiguous - no LLM needed at all)
+   │
+   └─ anything else ──────────────────────► cloud LLM agent, given ONLY the tool(s) that
+                                              action needs:
+                                                search_products / one_product → [search_products]
+                                                check_stock                   → [search_products, check_stock]
+                                              The LLM extracts the exact product, applies
+                                              "under $50" reasoning, and writes the answer -
+                                              a free-text/reasoning job, correctly left to it.
+```
 
-`client.py`'s `ask_with_laya()`: for `search_products` (browsing), it searches by `category`
-when Laya found one, else the raw question. For `check_stock`/`one_product` (need exactly ONE
-product), it always searches using the raw question text - not the category, which is too
-broad and would almost always match several products - then explicitly handles 0 matches ("no
-product matches..."), exactly 1 match (resolved), or 2+ matches (reports the names and asks the
-user to be more specific, rather than silently picking one).
+`_ACTION_TOOLS` in `client.py` is that narrowing table. This is the realistic production use of
+a fast local classifier in front of an LLM: it doesn't try to replace the LLM, it cuts down what
+the LLM has to consider before the LLM runs - smaller toolset, less ambiguity, lower cost - while
+leaving every free-text/arithmetic/disambiguation job to the model actually built for it.
 
-**What this still doesn't do, honestly:**
-- *Price filtering* ("under $50") is never applied here - Exercise 2's LLM did that itself when
-  writing its final answer. A price range isn't a label from a fixed set, it's arithmetic over
-  numbers - a real, structural gap, not a bug to patch with more `choice` questions. That's the
-  line between "classify among known options" (what Laya does well) and "reason over arbitrary
-  values" (what still needs something generative).
-- *Shared-word ambiguity* ("wireless" matching both the headphones and the earbuds) is reported
-  as ambiguous rather than resolved, because a keyword search genuinely can't tell which one a
-  human would obviously mean - that distinction needs understanding, not just word overlap. A
-  generative LLM (Exercise 2) resolves this correctly because it actually reads the phrase
-  "wireless headphones" as a unit, not as two independent keywords.
-- A small, fixed stopword list (`_STOPWORDS` in `catalog.py`) keeps filler words ("the", "in",
-  "is", ...) from accidentally word-matching inside an unrelated product's name - without it,
-  "...in stock?" would spuriously match "Learn Python **in** a Weekend". A bigger catalog would
-  want a real stopword library, but the principle holds at any scale.
+Verified live, same 3 demo questions as Exercise 2, now all correct with no dead ends:
 
-One more honest caveat, confirmed live: this checkpoint logs
+| Question | Laya action | Result |
+|---|---|---|
+| "Do you have wireless headphones in stock?" | `check_stock` (0.84) | "Yes, we have Wireless Headphones in stock. There are 12 units available." - the earlier version misfired here (reported "ambiguous" against both Headphones/Earbuds); the LLM resolves it correctly because it reads the phrase as a unit, not as keywords |
+| "What electronics do you sell for under $50?" | `search_products` (0.17) | Wireless Headphones ($49.99), USB-C Charging Cable ($9.99) - correctly excludes the $89 keyboard and $59 earbuds, with no regex involved |
+| "Is the mechanical keyboard available right now?" | `one_product` (0.05) | "...currently out of stock and not available for purchase at this time." |
+
+One honest caveat, confirmed live: this checkpoint logs
 `RuntimeWarning: laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]`
 on load - some of its confidence values get clamped and are explicitly flagged as
 uncalibrated. Treat any single confidence number with some skepticism rather than as a precise
-probability.
+probability; it doesn't change which action gets picked, it only means the number next to it
+isn't perfectly calibrated.
 
-**The actual lesson:** a local classifier correctly resolves anything that's genuinely a choice
-among a small, known set - action and category qualify at any catalog size. "Which exact
-product" is a search/ranking problem, not a classification problem, the moment the catalog is
-large - and routing it to a real search index instead of a per-item label is what makes this
-design hold up from 8 products to thousands, instead of only working as a demo.
+**The actual lesson:** a local classifier is genuinely useful in front of an LLM - not as a
+replacement for it, but as a router that narrows scope before the expensive model runs. The
+three earlier failures all came from asking the classifier (or plain code pretending to be one)
+to do free-text extraction or arithmetic reasoning - jobs that need an LLM. Once Laya's job was
+limited to the one thing it's actually built for (a fixed multiple-choice decision), and the LLM
+got to do the rest, every demo question resolved correctly.
 
 ```
 python -m catalog_mcp       # runs Exercise 3 automatically after Exercise 1 and 2

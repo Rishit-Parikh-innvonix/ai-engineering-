@@ -12,7 +12,7 @@ import json
 import sys
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from catalog_mcp import laya_router
@@ -40,27 +40,14 @@ def build_client() -> MultiServerMCPClient:
     )
 
 
-def log_tool_calls(messages: list) -> None:
-    for message in messages:
-        if isinstance(message, AIMessage) and message.tool_calls:
-            for call in message.tool_calls:
-                print(f"  -> agent called {call['name']}({call['args']})")
-
-
 async def ask(client: MultiServerMCPClient, question: str) -> None:
     tools = await client.get_tools(server_name="catalog")
     agent = create_agent(get_cloud_chat_model(), tools, system_prompt=SYSTEM_PROMPT)
 
-    print(f"You ask: {question}")
     result = await agent.ainvoke({"messages": [HumanMessage(question)]})
-    log_tool_calls(result["messages"])
     final_message = result["messages"][-1]
-    print(f"\nAssistant replies:\n{final_message.content}\n")
-
-
-async def _call_tool(tools: list, name: str, args: dict) -> str:
-    tool = next(t for t in tools if t.name == name)
-    return await tool.ainvoke(args)
+    print(f"Q: {question}")
+    print(f"A: {final_message.content.strip()}\n")
 
 
 def _as_products(raw) -> list[dict]:
@@ -76,55 +63,40 @@ def _as_products(raw) -> list[dict]:
     return raw if isinstance(raw, list) else [raw]
 
 
-async def ask_with_laya(client: MultiServerMCPClient, question: str) -> None:
-    """Exercise 3: action and category come from Laya's local classifier in one forward pass.
-    "Which exact product" is deliberately NOT asked of Laya - see laya_router.py for why that
-    doesn't scale - it's resolved by a real search call instead (catalog.search_products, via
-    the search_products tool), the same way a real system would handle "which one of
-    potentially thousands of rows does this match" rather than a fixed classification label."""
-    tools = await client.get_tools(server_name="catalog")
+# Which tool(s) the LLM actually needs for each action Laya can pick - this is the real payoff
+# of the classifier: it narrows the toolset handed to the LLM, instead of handing it everything
+# every time. "Which exact product" and anything requiring arithmetic ("under $50") is resolved
+# by the LLM itself via these tools - that's a free-text/reasoning job, not a classification job,
+# so it belongs to the LLM, not to Laya or to plain regex/substring code standing in for it.
+_ACTION_TOOLS = {
+    "search_products": ["search_products"],
+    "one_product": ["search_products"],
+    "check_stock": ["search_products", "check_stock"],
+}
 
-    print(f"You ask: {question}")
+
+async def ask_with_laya(client: MultiServerMCPClient, question: str) -> None:
+    """Exercise 3: Laya decides ONLY the action (a true 4-way multiple-choice question - see
+    laya_router.py). For "all_products" that's the whole answer, no LLM needed. For everything
+    else, Laya's pick narrows which tool(s) the cloud LLM agent gets to see, then the LLM - not
+    Laya, not plain code - resolves the exact product, applies any price filter, and writes the
+    final answer, exactly the way Exercise 2's ask() already does, just with a smaller toolset."""
+    print(f"Q: {question}")
     decision = laya_router.decide(question)
     action = decision["action"]
-    category = decision["category"]
-    print(
-        f"  -> action={action} ({decision['action_confidence']})  "
-        f"category={category} ({decision['category_confidence']})"
-    )
 
     if action == "all_products":
         resources = await client.get_resources("catalog", uris="catalog://products")
-        print(f"\nResult:\n{resources[0].as_string()}\n")
+        products = _as_products(resources[0].as_string())
+        names = ", ".join(p["name"] for p in products)
+        print(f"A: Here's everything we sell: {names}.\n")
         return
 
-    if action == "search_products":
-        # Browsing: category (a guaranteed-valid, bounded label) is a good search query when
-        # Laya found one; fall back to the raw question text otherwise - real search handles
-        # arbitrary free text fine, which is exactly the part a fixed-label classifier can't do.
-        search_query = category if category != laya_router.NO_CATEGORY else question
-        result = await _call_tool(tools, "search_products", {"query": search_query})
-        print(f"\nResult (searched {search_query!r}):\n{result}\n")
-        return
+    all_tools = await client.get_tools(server_name="catalog")
+    allowed_names = _ACTION_TOOLS.get(action, [t.name for t in all_tools])
+    scoped_tools = [t for t in all_tools if t.name in allowed_names]
 
-    # check_stock / one_product both need exactly ONE specific product, so the search query must
-    # be the specific words in the question itself (e.g. "wireless headphones"), NOT the broad
-    # category - "Electronics" alone matches several products and can only ever be ambiguous
-    # here. Resolve via search instead of a classification label, then handle the
-    # ambiguous/no-match cases explicitly - a real system can't just guess which one was meant.
-    matches = _as_products(await _call_tool(tools, "search_products", {"query": question}))
-    if not matches:
-        print(f"\nResult: no product matches {question!r}.\n")
-        return
-    if len(matches) > 1:
-        names = ", ".join(f'{m["name"]} ({m["id"]})' for m in matches)
-        print(f"\nResult: {question!r} matches more than one product - {names}. Ask about one of these by name.\n")
-        return
-    product_id = matches[0]["id"]
-
-    if action == "check_stock":
-        result = await _call_tool(tools, "check_stock", {"product_id": product_id})
-        print(f"\nResult:\n{result}\n")
-    else:  # one_product
-        resources = await client.get_resources("catalog", uris=f"catalog://products/{product_id}")
-        print(f"\nResult:\n{resources[0].as_string()}\n")
+    agent = create_agent(get_cloud_chat_model(), scoped_tools, system_prompt=SYSTEM_PROMPT)
+    result = await agent.ainvoke({"messages": [HumanMessage(question)]})
+    final_message = result["messages"][-1]
+    print(f"A: {final_message.content.strip()}\n")

@@ -1,27 +1,25 @@
 """
 Exercise 3: use Laya (a small, local, non-generative "typed decision" model - see
-https://github.com/NandhaKishorM/laya) to decide the ACTION and CATEGORY for a catalog
-question, instead of sending it to a cloud LLM and letting it decide via tool-calling.
+https://github.com/NandhaKishorM/laya) to decide the ACTION for a catalog question - which
+tool(s)/resource the request needs - instead of sending the whole decision to a cloud LLM.
 
 Laya does a single forward pass over text and returns a calibrated probability per labeled
 option from a FIXED set you give it - it classifies, it never generates or extracts free text.
+That's the ONLY thing asked of it here: "search / check stock / browse all / look up one
+product" is a true 4-way multiple-choice question.
 
-"Which exact product, out of N" is deliberately NOT one of Laya's questions. The first version
-of this exercise gave Laya one label per product - fine at 8 products, but it doesn't scale: at
-thousands of products you'd be scoring the question against thousands of candidate labels in a
-single forward pass (slower, and more likely to misfire as look-alike descriptions start
-out-competing the right one). "Which category" stays a safe fit for Laya at any catalog size -
-categories are bounded (a handful, maybe a few dozen) no matter how many products exist. So this
-router only asks Laya the two questions that stay small and fixed - action, category - and hands
-"which exact product" to catalog.search_products instead (see catalog.py), a real search index
-built for exactly the kind of lookup that grows with the data.
+Two earlier versions of this file tried to make Laya (or plain regex/substring code standing in
+for it) also resolve the EXACT product or apply a price filter - both are free-text understanding
+or arithmetic, not classification, and both failed for that reason (see README.md's "Exercise 3"
+section for the full story). The fix: Laya only narrows which tool(s) the LLM gets to see;
+client.py's ask_with_laya() hands the question to the cloud LLM agent with ONLY that narrowed
+toolset, and the LLM - which is actually built for free-text extraction and reasoning - resolves
+the product, price filter, or any ambiguity itself, via real tool calls.
 """
 
 from functools import lru_cache
 
 from laya import Router
-
-from catalog_mcp import catalog
 
 ACTIONS = {
     "search_products": "Search the catalog by name, category, or description keywords",
@@ -29,18 +27,6 @@ ACTIONS = {
     "all_products": "Browse the entire catalog with no filtering or search",
     "one_product": "Look up one specific product's full details by its exact id",
 }
-
-NO_CATEGORY = "none"
-
-
-@lru_cache(maxsize=1)
-def _category_criteria() -> dict[str, str]:
-    # Built from the live catalog, not hardcoded - a new category shows up here automatically,
-    # and this list stays small regardless of how many products exist.
-    categories = sorted({p["category"] for p in catalog.list_products()})
-    criteria = {c: f"Products in the {c} category" for c in categories}
-    criteria[NO_CATEGORY] = "No specific category is named or implied by the request"
-    return criteria
 
 
 @lru_cache(maxsize=1)
@@ -50,11 +36,6 @@ def _questions() -> dict:
             "type": "choice",
             "instructions": "Which catalog action should handle this customer request?",
             "criteria": ACTIONS,
-        },
-        "category": {
-            "type": "choice",
-            "instructions": "Which product category, if any, is this request about?",
-            "criteria": _category_criteria(),
         },
     }
 
@@ -67,18 +48,7 @@ def _get_router() -> Router:
 
 
 def decide(question: str) -> dict:
-    """One forward pass answering both questions at once (cheaper than two separate calls -
-    Laya's own docs recommend batching questions per request where possible).
-
-    Returns, e.g.:
-        {"action": "check_stock", "action_confidence": 0.84,
-         "category": "none", "category_confidence": 0.5}
-    """
+    """Returns, e.g.: {"action": "check_stock", "action_confidence": 0.84}"""
     result = _get_router().predict({"question": question}, _questions())
-    answers = result["answers"]
-    return {
-        "action": answers["action"]["choice"],
-        "action_confidence": answers["action"].get("confidence"),
-        "category": answers["category"]["choice"],
-        "category_confidence": answers["category"].get("confidence"),
-    }
+    answer = result["answers"]["action"]
+    return {"action": answer["choice"], "action_confidence": answer.get("confidence")}
