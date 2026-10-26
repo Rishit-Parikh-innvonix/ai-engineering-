@@ -18,6 +18,11 @@ without restructuring those calls (`include_raw=True`) - those calls are still t
 just recorded with token counts of 0. Everything going through `ask_for`/`ask_for_text` in
 agents/llm.py (the router, the relevance grader, the summarizer, the writer) has full token
 counts, when the model actually returns usage metadata (OpenRouter free-tier models don't always).
+
+Week 10 upgrade: every record_node/record_model_call call here also emits a real OpenTelemetry
+span (see otel.py) - the JSON file and the OTel spans are built from exactly the same timing
+data, they just go to two different places for two different purposes (this file: a portable,
+dependency-free ledger; otel.py: a trace tree viewable in a real tracing backend).
 """
 
 import contextvars
@@ -26,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from brief import config
+from brief import config, otel
 
 
 @dataclass
@@ -93,9 +98,16 @@ _current: contextvars.ContextVar["RunTrace | None"] = contextvars.ContextVar("br
 
 
 def start_trace(thread_id: str, topic: str) -> RunTrace:
-    trace = RunTrace(thread_id=thread_id, topic=topic)
-    _current.set(trace)
-    return trace
+    run_trace = RunTrace(thread_id=thread_id, topic=topic)
+    _current.set(run_trace)
+    otel.start_run_span(thread_id, topic)
+    return run_trace
+
+
+def end_trace() -> None:
+    """Closes the OTel root span for this run. Called once, when the run is finished, paused,
+    stopped or failed (research.py's _report_trace, in a `finally`)."""
+    otel.end_run_span()
 
 
 def current_trace() -> "RunTrace | None":
@@ -103,12 +115,25 @@ def current_trace() -> "RunTrace | None":
 
 
 def record_node(node: str, duration_s: float) -> None:
-    trace = current_trace()
-    if trace is not None:
-        trace.record_node(node, duration_s)
+    run_trace = current_trace()
+    if run_trace is not None:
+        run_trace.record_node(node, duration_s)
+    otel.record_after_the_fact(f"node.{node}", duration_s, {"brief.node": node})
 
 
 def record_model_call(node: str, usage: dict | None, duration_s: float) -> None:
-    trace = current_trace()
-    if trace is not None:
-        trace.record_model_call(node, usage, duration_s)
+    run_trace = current_trace()
+    if run_trace is not None:
+        run_trace.record_model_call(node, usage, duration_s)
+    usage = usage or {}
+    otel.record_after_the_fact(
+        f"model_call.{node or 'unknown'}",
+        duration_s,
+        {
+            "brief.node": node,
+            "llm.model": config.CLOUD_MODEL,
+            "llm.prompt_tokens": usage.get("input_tokens", 0),
+            "llm.completion_tokens": usage.get("output_tokens", 0),
+            "llm.total_tokens": usage.get("total_tokens", 0),
+        },
+    )

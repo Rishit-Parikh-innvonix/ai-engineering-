@@ -1,7 +1,8 @@
 """The main flowchart. Everything about HOW the agents are coordinated lives here:
 
   START -> input_guardrail -+-- blocked -----------------------------------------------> save -> END
-                             '-- allowed -> router -> research:    plan -> REVIEW PLAN -> [research subgraph] -> summarize -> ...
+                             '-- allowed -> llm_guardrail -+-- blocked --------------------------> save -> END
+                                                            '-- allowed -> router -> research:    plan -> REVIEW PLAN -> [research subgraph] -> summarize -> ...
                                                     -> weather:     weather_tool -> summarize -> ...        live data: no searching
                                                     -> mixed:       weather_tool -> plan -> REVIEW PLAN -> [research subgraph] -> ...
                                                     -> unsupported: save                                    needs live data we lack
@@ -21,7 +22,12 @@ Four new ideas on top of week 8:
   * SUBGRAPHS     the retrieve-and-check loop and the write-and-check loop are mini graphs in subgraphs/.
   * GUARDRAILS + TRACING (week 10)   input_guardrail is the new first node (see guardrails/input.py);
     save() runs the output guardrails (guardrails/output.py) before writing anything to disk; every
-    node and model call is timed and recorded via tracing.py.
+    node and model call is timed and recorded via tracing.py (JSON ledger + real OpenTelemetry
+    spans, see otel.py).
+  * LLM GUARDRAIL BACKSTOP (upgrade)   llm_guardrail runs right after input_guardrail, only on
+    requests the fast pattern check already allowed - an LLM classifies INTENT as a second layer
+    for reworded attempts regex can't catch (see guardrails/llm_guardrail.py). Optional: with no
+    model wired in (check_llm_guardrail=None, the default in tests) this node is a no-op.
 
 The path is fixed by this code. The AI agents only fill in the content of each box, and a person
 decides at the two critical points.
@@ -37,7 +43,7 @@ from langgraph.types import interrupt
 
 from brief import tracing
 from brief.agents.types import Agents
-from brief.guardrails import assess_groundedness, check_input, check_output_safety
+from brief.guardrails import LLMGuardrailVerdict, assess_groundedness, check_input, check_output_safety
 from brief.guardrails.output import ReportSchema
 from brief.logic import LIMITS, build_extractive_draft, build_library, build_report
 from brief.review import ReviewDecision, parse_draft_decision, parse_plan_decision
@@ -60,6 +66,7 @@ def create_research_graph(
     weather: WeatherTool,
     save_report: Callable[[str, str], Awaitable[str]],
     checkpointer: BaseCheckpointSaver,
+    check_llm_guardrail: Callable[[str], Awaitable[LLMGuardrailVerdict]] | None = None,
 ):
     # Agents and sources are arguments, not imports, so tests can plug in scripted stand-ins.
     # A checkpointer is required: pausing for a person (interrupt) is impossible without saved state.
@@ -86,6 +93,38 @@ def create_research_graph(
             log_step("Input guardrail", f"redacted PII before processing: {', '.join(result.redactions)}")
             notes.append(f"Personal information ({', '.join(result.redactions)}) was redacted from the topic before it was processed.")
         return {"topic": result.sanitized_topic, "run_notes": notes}
+
+    # ---- Upgrade: an LLM-backed second guardrail layer (see guardrails/llm_guardrail.py). Runs
+    # only on requests the fast pattern check already allowed, as a backstop for the reworded
+    # attempts a fixed regex list is documented to miss. If no model is wired in (tests, or a
+    # deployment that opts out), check_llm_guardrail is None and this node is a fast no-op.
+    async def llm_guardrail(state: ResearchState):
+        if check_llm_guardrail is None:
+            return {}
+        started = time.monotonic()
+        try:
+            verdict = await check_llm_guardrail(state["topic"])
+        except Exception as error:  # noqa: BLE001 - fail OPEN: a classifier outage must not block real requests
+            log_step("LLM guardrail", f"failed ({_message(error)}) - allowing the request (pattern check already passed)")
+            tracing.record_node("llm_guardrail", time.monotonic() - started)
+            return {"run_notes": [f"The LLM backstop guardrail failed ({_message(error)}) and was skipped for this run."]}
+        tracing.record_node("llm_guardrail", time.monotonic() - started)
+
+        if verdict.is_injection:
+            reason = "A second-layer LLM check flagged this request as an attempt to override the assistant's instructions."
+        elif verdict.unsafe_category and verdict.unsafe_category != "none":
+            reason = f"A second-layer LLM check flagged this request as falling into a category this assistant will not research ({verdict.unsafe_category})."
+        elif verdict.is_off_topic:
+            reason = "A second-layer LLM check flagged this as not a research topic this assistant can help with."
+        else:
+            return {}
+
+        log_step("LLM guardrail", f"blocked: {reason} ({verdict.reasoning})")
+        return {
+            "blocked": reason,
+            "draft": f"## Request blocked\n\nThis request was not researched. {reason}",
+            "run_notes": [f"LLM backstop guardrail blocked this request: {reason} ({verdict.reasoning})"],
+        }
 
     # ---- Agent nodes: each one reads the notebook and returns only what it changed ----
 
@@ -344,6 +383,9 @@ def create_research_graph(
     # ---- Routers: these are the diamonds in the flowchart ----
 
     def after_input_guardrail(state: ResearchState):
+        return "save" if state["blocked"] else "llm_guardrail"
+
+    def after_llm_guardrail(state: ResearchState):
         return "save" if state["blocked"] else "router"
 
     def after_route(state: ResearchState):
@@ -372,6 +414,7 @@ def create_research_graph(
 
     graph = StateGraph(ResearchState)
     graph.add_node("input_guardrail", input_guardrail)
+    graph.add_node("llm_guardrail", llm_guardrail)
     graph.add_node("router", router)
     graph.add_node("weather_tool", weather_tool)
     graph.add_node("unsupported", unsupported)
@@ -385,7 +428,8 @@ def create_research_graph(
     graph.add_node("save", save)
 
     graph.add_edge(START, "input_guardrail")
-    graph.add_conditional_edges("input_guardrail", after_input_guardrail, ["router", "save"])
+    graph.add_conditional_edges("input_guardrail", after_input_guardrail, ["llm_guardrail", "save"])
+    graph.add_conditional_edges("llm_guardrail", after_llm_guardrail, ["router", "save"])
     graph.add_conditional_edges("router", after_route, ["weather_tool", "unsupported", "plan"])
     graph.add_conditional_edges("weather_tool", after_weather, ["summarize", "plan"])
     graph.add_edge("unsupported", "save")

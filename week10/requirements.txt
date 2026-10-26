@@ -6,9 +6,15 @@ langchain-core>=1.6,<2
 pydantic>=2.13,<3
 httpx>=0.28,<1
 python-dotenv>=1.2,<2
-pytest>=9,<10
 
 # Week 10: optional LangSmith tracing. langchain_core auto-traces to LangSmith whenever
 # LANGCHAIN_TRACING_V2/LANGCHAIN_API_KEY are set (see .env.example) - this package just needs to
 # be installed for that to work; nothing in brief/ imports it directly.
 langsmith>=0.3,<1
+
+# Week 10 upgrade: real OpenTelemetry spans (see brief/otel.py). The OTLP exporter is included so
+# OTEL_EXPORTER_OTLP_ENDPOINT works out of the box; without it, spans go to a local log file -
+# no collector needed to try it.
+opentelemetry-api>=1.27,<2
+opentelemetry-sdk>=1.27,<2
+opentelemetry-exporter-otlp-proto-http>=1.27,<2

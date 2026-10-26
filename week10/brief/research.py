@@ -26,6 +26,7 @@ from brief import tracing
 from brief.agents import create_agents
 from brief.config import CHECKPOINT_DB, TRACES_DIR
 from brief.graph import create_research_graph
+from brief.guardrails import create_llm_guardrail
 from brief.models import get_cloud_chat_model
 from brief.persistence import list_threads, open_checkpointer
 from brief.report import save_report_to_disk
@@ -42,12 +43,16 @@ DEFAULT_TIMEOUT_S = 8 * 60
 
 
 def build_graph(checkpointer):
+    # One model instance, shared by the agents and the LLM guardrail backstop - no reason to pay
+    # for (or configure) two separate connections to the same free model.
+    model = get_cloud_chat_model()
     return create_research_graph(
-        agents=create_agents(get_cloud_chat_model()),
+        agents=create_agents(model),
         fetchers=DEFAULT_FETCHERS,
         weather=open_meteo_weather,
         save_report=save_report_to_disk,
         checkpointer=checkpointer,
+        check_llm_guardrail=create_llm_guardrail(model),
     )
 
 
@@ -137,11 +142,13 @@ def _report_trace() -> None:
     summary = trace.summary()
     path = TRACES_DIR / f"{trace.thread_id}-{int(time.time())}.json"
     trace.save(path)
+    tracing.end_trace()
     print_section_header("Trace summary (Week 10)", "-")
     print(f"  total latency:    {summary['total_latency_s']}s")
     print(f"  graph nodes:      {summary['node_count']}")
     print(f"  model calls:      {summary['model_call_count']}  ({summary['total_tokens']} tokens, ${summary['estimated_cost_usd']})")
     print(f"  saved to:         {path}")
+    print(f"  otel spans:       {TRACES_DIR / 'otel-spans.log'} (or your OTEL_EXPORTER_OTLP_ENDPOINT collector)")
 
 
 async def drive(graph, thread: str, first_input: Any, *, auto: bool, interactive: bool, timeout: float) -> int:
@@ -163,7 +170,7 @@ async def drive(graph, thread: str, first_input: Any, *, auto: bool, interactive
                     print_pause_instructions(thread, payload)
                     return 0
         except (asyncio.TimeoutError, KeyboardInterrupt, asyncio.CancelledError):
-            print(f"\nStopped before finishing. Nothing is lost - the run was saved after every step.")
+            print("\nStopped before finishing. Nothing is lost - the run was saved after every step.")
             print(f"Continue with:  python -m brief resume {thread}")
             return 2
         except Exception as error:  # noqa: BLE001
